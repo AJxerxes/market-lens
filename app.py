@@ -195,7 +195,7 @@ if "scheduler_started" not in st.session_state:
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown(wait=False))
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
     [
         "Watchlist Overview",
         "Company Deep Dive",
@@ -204,7 +204,8 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
         "Weekly Sector Digest",
         "Congressional Trading",
         "Tracked Funds",
-        "Agent Activity Log",
+        "Agent Brain",
+        "Signals & Intelligence",
     ]
 )
 
@@ -1010,7 +1011,7 @@ with tab7:
     finally:
         session.close()
 
-# ----- Tab 8: Agent Activity Feed, Supplier Registry, Leadership Events, Diagnostics -----
+# ----- Tab 8: Agent Brain (activity feed + alert diagnostics) -----
 with tab8:
     st.subheader("Alert diagnostics")
     st.caption("Send a test Telegram and test email to verify delivery. Either live data (success) or a clear error is shown.")
@@ -1048,6 +1049,8 @@ with tab8:
     finally:
         session.close()
 
+# ----- Tab 9: Signals & Intelligence (Substack, Supplier Registry, Leadership Events) -----
+with tab9:
     st.subheader("Substack Intelligence")
     session = _session()
     try:
