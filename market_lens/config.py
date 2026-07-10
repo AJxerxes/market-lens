@@ -88,7 +88,7 @@ DISPLAY_TIMEZONE = os.getenv("DISPLAY_TIMEZONE", "America/New_York")
 # Defaults align with current Anthropic model IDs; override via .env if needed.
 CLAUDE_SONNET_MODEL = os.getenv(
     "CLAUDE_SONNET_MODEL",
-    "claude-sonnet-4-20250514",
+    "claude-sonnet-5",
 )
 CLAUDE_HAIKU_MODEL = os.getenv(
     "CLAUDE_HAIKU_MODEL",
