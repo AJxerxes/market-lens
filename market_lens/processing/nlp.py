@@ -10,7 +10,7 @@ import requests
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-from market_lens.config import DATABASE_URL, NEWSAPI_KEY, DASHBOARD_BASE_URL
+from market_lens.config import DATABASE_URL, NEWSAPI_KEY, MARKETAUX_API_KEY, DASHBOARD_BASE_URL
 from market_lens.database.models import Base, Company, NewsSentiment, RiskFactorDelta, SupplierSignal, SignalType, SignalSeverity
 
 SUPPLIER_KEYWORDS = [
@@ -27,7 +27,7 @@ SUPPLIER_KEYWORDS = [
 def _engine_session():
     engine = create_engine(DATABASE_URL)
     Session = sessionmaker(bind=engine)
-    return engine, Session()
+    return engine, Session
 
 
 def _get_sentiment_haiku(headline: str, description: str = "") -> tuple:
@@ -52,7 +52,12 @@ def _get_sentiment_haiku(headline: str, description: str = "") -> tuple:
             ),
             max_tokens=50,
         )
-        clean = result.strip().replace("```json", "").replace("```", "").strip()
+        import re as _re
+        clean = result.strip()
+        clean = _re.sub(r"```json|```", "", clean).strip()
+        # Extract only the first JSON object found
+        match = _re.search(r"\{.*?\}", clean, _re.DOTALL)
+        clean = match.group(0) if match else clean
         data = json.loads(clean)
         label = data.get("label", "neutral")
         if isinstance(label, str):
@@ -73,149 +78,174 @@ def _sentiment_to_score(label: str, score: float) -> float:
     return 0.0
 
 
-def run_news_sentiment_for_ticker(session, ticker: str, company_name: str) -> int:
-    """Fetch last 30 days news from NewsAPI, run Haiku sentiment, store in news_sentiment. Returns count stored."""
-    if not NEWSAPI_KEY:
-        print("  [WARN] NEWSAPI_KEY not set, skipping news sentiment")
+WATCHLIST_SECTOR_BATCHES = {
+    "cybersecurity": ["ZS", "PANW", "FTNT", "TENB", "VRNS", "S", "NET"],
+    "semiconductors": ["NXPI", "CALX", "IOT"],
+    "transport_logistics": ["JBHT", "APTV", "SYY"],
+    "audio_niche": ["DLB", "CTTAF", "ASAZY"],
+    "etfs": ["QQQ", "SPY"],
+}
+
+
+def run_news_sentiment_batched(session) -> int:
+    """
+    Fetch news for all watchlist tickers using sector-batched requests.
+    5 requests total instead of 1 per ticker. Stores results in news_sentiment.
+    Returns total article count stored.
+    """
+    if not MARKETAUX_API_KEY:
+        print("  [WARN] MARKETAUX_API_KEY not set, skipping news sentiment")
         return 0
-    from_date = (date.today() - timedelta(days=30)).isoformat()
-    url = (
-        f"https://newsapi.org/v2/everything?q={company_name.replace(' ', '%20')}"
-        f"&from={from_date}&sortBy=publishedAt&language=en&pageSize=20&apiKey={NEWSAPI_KEY}"
-    )
-    try:
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return 0
-        data = r.json()
-        articles = data.get("articles") or []
-    except Exception as e:
-        print(f"  [ERROR] NewsAPI {ticker}: {e}")
-        return 0
-    count = 0
-    for art in articles[:20]:
-        title = art.get("title") or ""
-        desc = art.get("description") or ""
-        if not (title or desc):
-            continue
-        try:
-            label, score = _get_sentiment_haiku(title, desc)
-        except Exception:
-            continue
-        pub = art.get("publishedAt")
-        if pub:
-            try:
-                dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
-            except Exception:
-                dt = datetime.now(timezone.utc)
-        else:
-            dt = datetime.now(timezone.utc)
-        session.add(
-            NewsSentiment(
-                ticker=ticker,
-                article_date=dt,
-                headline=title[:500],
-                source=art.get("source", {}).get("name"),
-                url=art.get("url"),
-                sentiment_score=score,
-                sentiment_label=label,
-            )
+
+    total_stored = 0
+
+    for sector, tickers in WATCHLIST_SECTOR_BATCHES.items():
+        symbols = ",".join(tickers)
+        url = (
+            f"https://api.marketaux.com/v1/news/all"
+            f"?symbols={symbols}&filter_entities=true&limit=3&language=en"
+            f"&api_token={MARKETAUX_API_KEY}"
         )
-        count += 1
-    session.flush()
-    return count
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code != 200:
+                print(f"  [WARN] MarketAux {sector}: HTTP {r.status_code}")
+                continue
+            data = r.json()
+            articles = data.get("data") or []
+        except Exception as e:
+            print(f"  [ERROR] MarketAux {sector}: {e}")
+            continue
+
+        for art in articles:
+            title = art.get("title") or ""
+            desc = art.get("description") or ""
+            if not (title or desc):
+                continue
+
+            # Determine which watchlist tickers this article mentions
+            mentioned = []
+            entities = art.get("entities") or []
+            for entity in entities:
+                sym = (entity.get("symbol") or "").upper()
+                if sym in tickers:
+                    mentioned.append(sym)
+            if not mentioned:
+                mentioned = tickers  # fallback: tag all tickers in batch
+
+            pub = art.get("published_at")
+            if pub:
+                try:
+                    dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+                except Exception:
+                    dt = datetime.now(timezone.utc)
+            else:
+                dt = datetime.now(timezone.utc)
+
+            try:
+                label, score = _get_sentiment_haiku(title, desc)
+            except Exception:
+                label, score = "neutral", 0.0
+
+            for ticker in mentioned:
+                existing = session.query(NewsSentiment).filter_by(
+                    ticker=ticker, headline=title[:500]
+                ).first()
+                if existing:
+                    continue
+                session.add(
+                    NewsSentiment(
+                        ticker=ticker,
+                        article_date=dt,
+                        headline=title[:500],
+                        source=art.get("source"),
+                        url=art.get("url"),
+                        sentiment_score=score,
+                        sentiment_label=label,
+                    )
+                )
+                total_stored += 1
+
+        session.flush()
+        print(f"  [OK] MarketAux {sector}: {len(articles)} articles processed")
+
+    return total_stored
 
 
 def fetch_macro_news_snapshot() -> Dict[str, Any]:
     """
-    Fetch top 20 macro articles from the last 24h across a fixed set of themes
-    and run Haiku sentiment. Returns a snapshot dict with both raw articles
-    and grouped-by-theme aggregates for use in the Macro tab.
+    Fetch macro news from MarketAux using topic filters.
+    5 requests covering technology, energy, politics, finance, economy.
+    Returns structured dict with articles grouped by theme.
     """
-    if not NEWSAPI_KEY:
-        return {"error": "NEWSAPI_KEY is not set"}
+    if not MARKETAUX_API_KEY:
+        return {"error": "MARKETAUX_API_KEY is not set"}
 
-    # Macro themes to track; keys are internal, values are query phrases
-    themes = {
-        "fed_policy": "Federal Reserve",
-        "inflation": "inflation",
-        "supply_chain": "supply chain",
-        "semiconductors": "semiconductor",
-        "ai_infrastructure": "AI infrastructure",
-        "energy": "energy demand",
-        "consumer": "consumer spending",
+    macro_topics = {
+        "technology": "technology",
+        "energy": "energy",
+        "geopolitics": "politics",
+        "finance": "finance",
+        "economy": "economy",
     }
-    # Single OR query to keep NewsAPI usage efficient
-    query = " OR ".join(themes.values())
-    from_dt = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-    url = (
-        "https://newsapi.org/v2/everything"
-        f"?q={query.replace(' ', '%20')}"
-        f"&from={from_dt}&sortBy=publishedAt&language=en&pageSize=20&apiKey={NEWSAPI_KEY}"
-    )
-    try:
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return {"error": f"NewsAPI error HTTP {r.status_code}"}
-        data = r.json()
-        articles = data.get("articles") or []
-    except Exception as e:
-        return {"error": f"NewsAPI request failed: {e}"}
-
-    def classify_theme(title: str, desc: str) -> str:
-        text = (title + " " + desc).lower()
-        for key, phrase in themes.items():
-            if phrase.lower() in text:
-                return key
-        return "other"
 
     enriched: List[Dict[str, Any]] = []
-    for art in articles[:20]:
-        title = art.get("title") or ""
-        desc = art.get("description") or ""
-        if not (title or desc):
-            continue
-        try:
-            label, score = _get_sentiment_haiku(title, desc)
-        except Exception:
-            continue
-        theme = classify_theme(title, desc)
-        pub = art.get("publishedAt")
-        try:
-            pub_dt = datetime.fromisoformat(pub.replace("Z", "+00:00")) if pub else None
-        except Exception:
-            pub_dt = None
-        enriched.append(
-            {
-                "title": title,
-                "description": desc,
-                "url": art.get("url"),
-                "source": art.get("source", {}).get("name"),
-                "published_at": pub_dt.isoformat() if pub_dt else pub,
-                "theme": theme,
-                "sentiment_score": score,
-                "sentiment_label": label,
-            }
-        )
 
-    # Group by theme
+    for theme_key, topic in macro_topics.items():
+        url = (
+            f"https://api.marketaux.com/v1/news/all"
+            f"?topics={topic}&limit=3&language=en"
+            f"&api_token={MARKETAUX_API_KEY}"
+        )
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            articles = data.get("data") or []
+        except Exception:
+            continue
+
+        for art in articles:
+            title = art.get("title") or ""
+            desc = art.get("description") or ""
+            if not (title or desc):
+                continue
+            try:
+                label, score = _get_sentiment_haiku(title, desc)
+            except Exception:
+                label, score = "neutral", 0.0
+            pub = art.get("published_at")
+            try:
+                pub_dt = datetime.fromisoformat(pub.replace("Z", "+00:00")) if pub else None
+            except Exception:
+                pub_dt = None
+            enriched.append(
+                {
+                    "title": title,
+                    "description": desc,
+                    "url": art.get("url"),
+                    "source": art.get("source"),
+                    "published_at": pub_dt.isoformat() if pub_dt else pub,
+                    "theme": theme_key,
+                    "sentiment_score": score,
+                    "sentiment_label": label,
+                }
+            )
+
     grouped: Dict[str, Dict[str, Any]] = {}
     for art in enriched:
         theme = art["theme"]
         g = grouped.setdefault(theme, {"theme": theme, "articles": [], "avg_sentiment": 0.0})
         g["articles"].append(art)
-
     for theme, g in grouped.items():
         scores = [a["sentiment_score"] for a in g["articles"]]
         g["avg_sentiment"] = sum(scores) / len(scores) if scores else 0.0
-        # Keep a couple of representative headlines
         g["examples"] = [a["title"] for a in g["articles"][:3]]
 
     return {
         "themes": grouped,
         "articles": enriched,
-        "query_used": query,
-        "from_datetime": from_dt,
     }
 
 
@@ -231,8 +261,8 @@ def run_negative_news_alerts(as_of: Optional[date] = None) -> None:
     start_dt = datetime(as_of.year, as_of.month, as_of.day, tzinfo=timezone.utc)
     end_dt = start_dt + timedelta(days=1)
 
-    engine, Session = _engine_session()
-    session = Session()
+    engine, _Session = _engine_session()
+    session = _Session()
     try:
         rows = (
             session.query(NewsSentiment.ticker, NewsSentiment.sentiment_score)
@@ -315,21 +345,19 @@ def run_supplier_keyword_scan(session, ticker: str, transcript_text: str, source
 
 def run_nlp_pipeline(tickers: Optional[List[str]] = None) -> None:
     """Run news sentiment for all watchlist (batch once daily). Risk factor and supplier scan are called from edgar/transcript code."""
-    engine, Session = _engine_session()
+    engine, _SF = _engine_session(); session = _SF()
     Base.metadata.create_all(engine)
-    session = Session()
     try:
         if tickers is None:
             companies = session.query(Company).filter(Company.active == True).all()
             tickers = [(c.ticker, c.name or c.ticker) for c in companies]
         else:
             tickers = [(t, t) for t in tickers]
-        for ticker, name in tickers:
-            try:
-                n = run_news_sentiment_for_ticker(session, ticker, name)
-                print(f"  [OK] {ticker} news sentiment: {n} articles")
-            except Exception as e:
-                print(f"  [ERROR] {ticker}: {e}")
+        try:
+            n = run_news_sentiment_batched(session)
+            print(f"  [OK] MarketAux batched sentiment: {n} articles stored")
+        except Exception as e:
+            print(f"  [ERROR] MarketAux batched sentiment: {e}")
         session.commit()
         # After storing news sentiment, run negative news alerts for today
         try:
@@ -350,3 +378,5 @@ if __name__ == "__main__":
     print("Market Lens — NLP Pipeline")
     print("-------------------------")
     run_nlp_pipeline(tickers)
+
+

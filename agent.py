@@ -95,8 +95,8 @@ def _run_nlp():
 
 def _run_congress():
     from market_lens.ingestion.congress_tracker import ingest_house_disclosures, ingest_senate_disclosures
-    ingest_house_disclosures(limit=500)
-    ingest_senate_disclosures(limit=500)
+    ingest_house_disclosures()
+    ingest_senate_disclosures()
     logger.info("Congress disclosures finished.")
 
 
@@ -134,6 +134,12 @@ def _run_substack_feeds():
     from market_lens.ingestion.substack_reader import run_substack_ingestion
     run_substack_ingestion()
     logger.info("Substack feeds ingestion finished.")
+
+
+def _run_sector_scan():
+    from market_lens.ingestion.sector_scanner import run_sector_scan
+    run_sector_scan()
+    logger.info("Sector scan finished.")
 
 
 def _run_daily_digest_morning():
@@ -216,6 +222,18 @@ def main():
     scheduler = BlockingScheduler(timezone=ET)
     # Daily 06:00 ET
     scheduler.add_job(_run_daily_chain, CronTrigger(hour=6, minute=0, timezone=ET), id="daily_chain")
+    # Intraday price quotes every 15 min during market hours
+    scheduler.add_job(
+        lambda: __import__("market_lens.ingestion.prices", fromlist=["run_intraday_quotes"]).run_intraday_quotes(),
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-15",
+            minute="0,15,30,45",
+            timezone=ET,
+        ),
+        id="intraday_quotes",
+        name="Intraday price quotes (15-min)",
+    )
     # Daily 07:00 ET
     scheduler.add_job(_run_congress, CronTrigger(hour=7, minute=0, timezone=ET), id="congress")
     scheduler.add_job(_run_court_dockets, CronTrigger(hour=7, minute=15, timezone=ET), id="court_dockets")
@@ -224,12 +242,35 @@ def main():
     scheduler.add_job(_run_daily_digest_morning, CronTrigger(hour=7, minute=0, timezone=ET), id="daily_digest_morning")
     # Daily 19:00 ET — evening briefing
     scheduler.add_job(_run_daily_digest_evening, CronTrigger(hour=19, minute=0, timezone=ET), id="daily_digest_evening")
+    # Earnings calendar refresh (Mon/Wed/Fri 07:30 ET)
+    scheduler.add_job(
+        lambda: __import__("market_lens.ingestion.earnings", fromlist=["ingest_earnings_calendar"]).ingest_earnings_calendar(),
+        CronTrigger(day_of_week="mon,wed,fri", hour=7, minute=30, timezone=ET),
+        id="earnings_calendar",
+        name="Earnings calendar refresh",
+    )
+    # Short interest refresh (Saturday 08:00 ET)
+    scheduler.add_job(
+        lambda: __import__("market_lens.ingestion.short_interest", fromlist=["ingest_short_interest"]).ingest_short_interest(),
+        CronTrigger(day_of_week="sat", hour=8, minute=0, timezone=ET),
+        id="short_interest",
+        name="Short interest refresh",
+    )
+    # Debt maturity schedule refresh (1st of month 09:00 ET)
+    scheduler.add_job(
+        lambda: __import__("market_lens.ingestion.debt_maturity", fromlist=["ingest_debt_maturities"]).ingest_debt_maturities(),
+        CronTrigger(day=1, hour=9, minute=0, timezone=ET),
+        id="debt_maturity",
+        name="Debt maturity schedule refresh",
+    )
     # Daily 08:00 ET
     scheduler.add_job(_run_tracked_funds, CronTrigger(hour=8, minute=0, timezone=ET), id="tracked_funds")
     scheduler.add_job(_run_agent_brain, CronTrigger(hour=8, minute=30, timezone=ET), id="agent_brain")
-    # Saturday 20:00 ET — full weekly digest (internally runs the sector scan first)
+    # Saturday 20:00 ET — full weekly digest
+    scheduler.add_job(_run_sector_scan, CronTrigger(day_of_week="sat", hour=20, minute=0, timezone=ET), id="sector_scan")
     scheduler.add_job(_run_weekly_digest, CronTrigger(day_of_week="sat", hour=20, minute=0, timezone=ET), id="weekly_digest")
-    logger.info("Agent scheduler started (ET). Jobs: daily_chain 06:00, congress 07:00, daily_digest 07:00/19:00, tracked_funds 08:00, agent_brain 08:30, weekly_digest (incl. sector scan) Sat 20:00.")
+
+    logger.info("Agent scheduler started (ET). Jobs: daily_chain 06:00, congress 07:00, daily_digest 07:00/19:00, tracked_funds 08:00, agent_brain 08:30, sector_scan+weekly_digest Sat 20:00.")
     scheduler.start()
 
 

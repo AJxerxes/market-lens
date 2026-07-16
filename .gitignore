@@ -96,5 +96,6 @@ credentials/
 
 # Stale export artifacts (duplicates of live market_lens/ package)
 export/
+MarketLens_Export.zip
 MarketLens_Export_Clean.zip
 GitHub Upload/

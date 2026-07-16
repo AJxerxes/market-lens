@@ -104,3 +104,21 @@ def summarize_low_stakes(system_prompt: str, user_content: str, max_tokens: int 
         max_tokens=max_tokens,
     )
 
+
+def call_claude_sonnet(system_prompt: str, user_text: str, max_tokens: int = 1000) -> str:
+    """
+    Convenience wrapper for high-stakes synthesis tasks using Claude Sonnet.
+
+    Intended for:
+    - Weekly / deep-dive digests.
+    - Cross-signal synthesis where hallucinations are costly.
+    """
+    client = _get_client()
+    return _build_message(
+        client=client,
+        model=config.CLAUDE_SONNET_MODEL,
+        system_prompt=system_prompt,
+        user_content=user_text,
+        max_tokens=max_tokens,
+    )
+

@@ -149,9 +149,15 @@ def _component_news_sentiment_30d(session, ticker: str) -> float:
 
 
 def _should_skip_lynch(company: Company) -> bool:
-    """Return True if Lynch score should not be computed (e.g. OTC with incomplete data)."""
+    """Return True if Lynch score should not be computed."""
     if not company:
         return True
+    # OTC ADRs often have incomplete flags but can still be scored if market_cap exists
+    is_otc = "otc" in str(company.instrument_type or "").lower()
+    if is_otc:
+        # For OTC just need market_cap at minimum
+        return company.market_cap is None
+    # For regular equities require complete flag and key fields
     if (company.data_quality_flag or "").lower() != "complete":
         return True
     if company.market_cap is None or company.trailing_pe is None:

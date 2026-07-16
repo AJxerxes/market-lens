@@ -36,41 +36,25 @@ class WatchlistManager:
     def search_ticker(self, query: str) -> Dict[str, Any]:
         """
         Search for ticker by symbol or company name.
-        
+
+        Strategy:
+        1. Try FMP /search?query={input} — handles both tickers and company names.
+           If FMP returns results, use the first match's symbol to pull yfinance data.
+        2. Only if FMP returns nothing (or FMP_API_KEY is not set), try yfinance
+           directly with the raw input as a ticker symbol.
+
+        This ensures "apple" → FMP → AAPL → yfinance(AAPL) works correctly.
+
         Args:
             query: Ticker symbol or company name
-            
+
         Returns:
             Dict with 'matches' list and optional 'resolved_ticker'
         """
         query = query.strip()
-        upper_query = query.upper()
-        
-        # If looks like a ticker (2-5 uppercase letters), validate directly
-        if len(query) <= 5 and upper_query.isalpha():
-            try:
-                ticker_obj = yf.Ticker(upper_query)
-                info = ticker_obj.info
-                
-                if info and 'symbol' in info:
-                    return {
-                        "matches": [{
-                            "ticker": info.get('symbol', upper_query),
-                            "name": info.get('longName', info.get('shortName', 'Unknown')),
-                            "sector": info.get('sector', 'Unknown'),
-                            "exchange": info.get('exchange', 'Unknown'),
-                            "quote_type": info.get('quoteType', 'EQUITY'),
-                        }],
-                        "resolved_ticker": info.get('symbol', upper_query),
-                        "needs_confirmation": False,
-                    }
-            except Exception as e:
-                print(f"Error validating ticker {query}: {e}")
-        
-        # Company name search - preferred: FMP search endpoints, fallback to yfinance
         matches: List[Dict[str, Any]] = []
 
-        # Try Financial Modeling Prep search (symbol/name) if API key is available
+        # --- Step 1: FMP search (handles both tickers and company names) ---
         if config.FMP_API_KEY:
             try:
                 resp = requests.get(
@@ -81,17 +65,19 @@ class WatchlistManager:
                 if resp.status_code == 200:
                     data = resp.json() or []
                     for item in data[:3]:
-                        matches.append({
-                            "ticker": (item.get("symbol") or "").upper(),
-                            "name": item.get("name") or item.get("symbol") or "",
-                            "sector": item.get("sector") or "Unknown",
-                            "exchange": item.get("exchangeShortName") or item.get("stockExchange", ""),
-                            "quote_type": "EQUITY",
-                        })
+                        sym = (item.get("symbol") or "").upper()
+                        if sym:
+                            matches.append({
+                                "ticker": sym,
+                                "name": item.get("name") or sym,
+                                "sector": item.get("sector") or "Unknown",
+                                "exchange": item.get("exchangeShortName") or item.get("stockExchange", ""),
+                                "quote_type": "EQUITY",
+                            })
             except Exception as e:
                 print(f"FMP search failed for '{query}': {e}")
 
-            # If symbol search returned nothing, fall back to FMP name search
+            # If /search returned nothing, try /search-name as a secondary FMP endpoint
             if not matches:
                 try:
                     resp2 = requests.get(
@@ -102,41 +88,64 @@ class WatchlistManager:
                     if resp2.status_code == 200:
                         data2 = resp2.json() or []
                         for item in data2[:3]:
-                            matches.append({
-                                "ticker": (item.get("symbol") or "").upper(),
-                                "name": item.get("name") or item.get("symbol") or "",
-                                "sector": item.get("sector") or "Unknown",
-                                "exchange": item.get("exchangeShortName") or item.get("stockExchange", ""),
-                                "quote_type": "EQUITY",
-                            })
+                            sym = (item.get("symbol") or "").upper()
+                            if sym:
+                                matches.append({
+                                    "ticker": sym,
+                                    "name": item.get("name") or sym,
+                                    "sector": item.get("sector") or "Unknown",
+                                    "exchange": item.get("exchangeShortName") or item.get("stockExchange", ""),
+                                    "quote_type": "EQUITY",
+                                })
                 except Exception as e:
                     print(f"FMP search-name failed for '{query}': {e}")
 
-        # Fallback to a lightweight yfinance lookup if FMP produced nothing
-        if not matches:
-            try:
-                ticker_obj = yf.Ticker(query)
-                info = ticker_obj.info
-                
-                if info and 'symbol' in info:
-                    matches.append({
-                        "ticker": info.get('symbol', query).upper(),
-                        "name": info.get('longName', info.get('shortName', 'Unknown')),
-                        "sector": info.get('sector', 'Unknown'),
-                        "exchange": info.get('exchange', 'Unknown'),
-                        "quote_type": info.get('quoteType', 'EQUITY'),
-                    })
-            except Exception as e:
-                print(f"Error searching for {query} via yfinance: {e}")
-        
+            # If FMP found a match, enrich the first result with live yfinance data
+            if matches:
+                resolved_sym = matches[0]["ticker"]
+                try:
+                    ticker_obj = yf.Ticker(resolved_sym)
+                    info = ticker_obj.info or {}
+                    if info and info.get("symbol"):
+                        matches[0].update({
+                            "ticker": info.get("symbol", resolved_sym).upper(),
+                            "name": info.get("longName") or info.get("shortName") or matches[0]["name"],
+                            "sector": info.get("sector") or matches[0]["sector"],
+                            "exchange": info.get("exchange") or matches[0]["exchange"],
+                            "quote_type": info.get("quoteType", "EQUITY"),
+                        })
+                except Exception as e:
+                    print(f"yfinance enrichment failed for '{resolved_sym}': {e}")
+
+                return {
+                    "matches": matches,
+                    "resolved_ticker": matches[0]["ticker"],
+                    "needs_confirmation": len(matches) > 1,
+                }
+
+        # --- Step 2: Fallback — yfinance direct lookup (no FMP or FMP returned nothing) ---
+        try:
+            upper_query = query.upper()
+            ticker_obj = yf.Ticker(upper_query)
+            info = ticker_obj.info or {}
+            if info and info.get("symbol"):
+                matches.append({
+                    "ticker": info.get("symbol", upper_query).upper(),
+                    "name": info.get("longName") or info.get("shortName") or "Unknown",
+                    "sector": info.get("sector") or "Unknown",
+                    "exchange": info.get("exchange") or "Unknown",
+                    "quote_type": info.get("quoteType", "EQUITY"),
+                })
+        except Exception as e:
+            print(f"yfinance fallback failed for '{query}': {e}")
+
         if matches:
-            # For name-based search, require user confirmation even if only one match
             return {
                 "matches": matches,
                 "resolved_ticker": matches[0]["ticker"],
-                "needs_confirmation": True,
+                "needs_confirmation": False,
             }
-        
+
         # No matches from FMP or yfinance
         base_error = f"No results found for '{query}'"
         if not config.FMP_API_KEY:

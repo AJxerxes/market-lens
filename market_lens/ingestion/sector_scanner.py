@@ -223,70 +223,66 @@ def run_daily_digest(slot: str = "morning") -> None:
     """
     from market_lens.agent.llm_client import summarize_low_stakes
     from market_lens.database.models import SubstackPost
+    from market_lens.database.watchlist import WatchlistManager
 
     session = SessionLocal()
     try:
         today = _utc_today()
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-        cutoff_d = cutoff.date()
 
-        bullets: List[str] = []
-        # News sentiment (last 24h)
-        news_rows = (
+        # Watchlist summary as baseline context
+        wl = WatchlistManager()
+        tickers = []
+        for c in wl.list_watchlist():
+            if hasattr(c, "ticker"):
+                tickers.append(c.ticker)
+            elif isinstance(c, dict) and "ticker" in c:
+                tickers.append(str(c["ticker"]))
+        watchlist_summary = (
+            f"Monitoring: {', '.join(tickers)}" if tickers else "Watchlist is currently empty."
+        )
+
+        # Recent news sentiment snapshot (last 5 articles)
+        recent_news = (
             session.query(NewsSentiment)
-            .filter(NewsSentiment.article_date >= cutoff_d)
-            .limit(50)
+            .order_by(NewsSentiment.article_date.desc())
+            .limit(5)
             .all()
         )
-        if news_rows:
-            bullets.append(f"News: {len(news_rows)} articles in last 24h; sample sentiment scores available.")
-        # New insider transactions
-        insiders = (
-            session.query(InsiderTransaction)
-            .filter(InsiderTransaction.filing_date >= cutoff_d)
-            .limit(30)
-            .all()
-        )
-        if insiders:
-            bullets.append(f"Insider: {len(insiders)} new filings in last 24h.")
-        # New congressional trades
-        trades = (
-            session.query(CongressTrade)
-            .filter(CongressTrade.disclosure_date >= cutoff_d)
-            .limit(30)
-            .all()
-        )
-        if trades:
-            bullets.append(f"Congress: {len(trades)} new disclosures in last 24h.")
-        # New substack posts today
-        try:
-            substack = (
-                session.query(SubstackPost)
-                .filter(SubstackPost.published_at >= cutoff)
-                .limit(20)
-                .all()
+        if recent_news:
+            news_summary = "; ".join(
+                f"{r.ticker} {r.sentiment_label} ({r.sentiment_score:.2f})"
+                for r in recent_news
+                if r.sentiment_score is not None
             )
-            if substack:
-                bullets.append(f"Substack: {len(substack)} new posts in last 24h.")
-        except Exception:
-            pass
+        else:
+            news_summary = "No recent news sentiment data yet."
 
-        if not bullets:
-            bullets = ["No significant activity in the last 24 hours."]
+        # Simple macro summary fallback (FRED-backed context can be wired later)
+        macro_summary = (
+            "Monitor Fed rate path, inflation trajectory, yield curve shape, and AI infrastructure spending."
+        )
 
-        context = "\n".join(bullets)
-        system_prompt = (
-            "You are an assistant that generates a brief market briefing in exactly 3 bullet points. "
-            "For each bullet: name the specific company or sector, describe what happened, and state whether "
-            "it is a positive, negative, or neutral signal. Be specific — no generic statements."
-        )
-        user_content = (
-            f"Generate a brief {slot} market briefing in 3 bullet points based on this data:\n{context}"
-        )
+        system_prompt = """You are a concise financial research assistant for a personal investment platform.
+Your job is to write a 3-bullet daily market briefing based on whatever data is available.
+Always write exactly 3 bullets. Never refuse or ask for more data.
+If market data is limited, summarize the macro environment and note what to watch.
+Format each bullet as: [SIGNAL] One clear sentence. (sector tag)
+SIGNAL must be one of: BULLISH, BEARISH, NEUTRAL, WATCH."""
+
+        user_content = f"""Write today's 3-bullet {slot} briefing for {today}.
+Available context:
+- Watchlist: {watchlist_summary}
+- Recent news sentiment: {news_summary}
+- Macro indicators: {macro_summary}
+
+Write 3 bullets now. Do not refuse. Do not ask questions. Just write the briefing."""
+
         try:
             full_text = summarize_low_stakes(system_prompt, user_content, max_tokens=400)
         except Exception as e:
-            full_text = f"Briefing unavailable: {e}. Raw: {context}"
+            fallback_context = f"Watchlist: {watchlist_summary}; News: {news_summary}; Macro: {macro_summary}"
+            full_text = f"Briefing unavailable: {e}. Raw: {fallback_context}"
 
         existing = (
             session.query(WeeklyDigest)
@@ -315,37 +311,68 @@ def run_daily_digest(slot: str = "morning") -> None:
 
 def run_weekly_digest() -> None:
     """
-    Full weekly digest: sector scan + deep analysis. Uses Claude Sonnet.
-    Runs Saturday 8pm ET. Stores with digest_type='weekly'.
-    """
-    from market_lens.agent.llm_client import synthesize_material_change
+    Generate weekly sector digest using Claude Sonnet.
 
-    run_sector_scan()
+    Uses last 7 days of news sentiment plus the current watchlist as context,
+    and overwrites the weekly placeholder row (if any) in WeeklyDigest.
+    """
+    from datetime import timedelta
+    from market_lens.agent.llm_client import call_claude_sonnet
+    from market_lens.database.watchlist import WatchlistManager
+
     today = _utc_today()
+    wl = WatchlistManager()
+
+    # Build watchlist ticker list (robust to dict- or ORM-style entries)
+    tickers: List[str] = []
+    for c in wl.list_watchlist():
+        if hasattr(c, "ticker"):
+            tickers.append(c.ticker)
+        elif isinstance(c, dict) and "ticker" in c:
+            tickers.append(str(c["ticker"]))
+
     session = SessionLocal()
     try:
-        scans = (
-            session.query(SectorScanResult)
-            .filter(SectorScanResult.scan_date == today)
-            .order_by(SectorScanResult.sector, SectorScanResult.rank_in_sector)
-            .limit(200)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        news_rows = (
+            session.query(NewsSentiment)
+            .filter(NewsSentiment.article_date >= cutoff)
+            .order_by(NewsSentiment.sentiment_score.desc().nullslast())
+            .limit(20)
             .all()
         )
-        context_lines = []
-        for s in scans[:50]:
-            context_lines.append(
-                f"{s.sector} | {s.ticker} | {s.company_name} | cap={s.market_cap} | week_ret={s.week_return}%"
+        if news_rows:
+            news_context = "\n".join(
+                f"{n.ticker}: {n.headline} ({n.sentiment_label} {n.sentiment_score:.2f})"
+                for n in news_rows
+                if n.sentiment_score is not None
             )
-        context = "\n".join(context_lines) or "No sector scan data yet."
-        system_prompt = (
-            "You are an assistant that produces a weekly sector digest. Summarize the key sectors, "
-            "highlight hidden giants (small-to-mid cap with positive momentum or reasonable P/E), "
-            "and provide a short watchlist suggestion."
-        )
+        else:
+            news_context = "No news sentiment data this week."
+
+        system_prompt = """You are a senior equity research analyst writing a weekly sector digest
+for a personal investment platform focused on AI infrastructure, cybersecurity, and supply chain.
+Write in a direct, analytical style. No fluff. Focus on what matters for position sizing and watchlist management."""
+
+        user_prompt = f"""Write a weekly sector digest for the week ending {today}.
+
+Watchlist: {', '.join(tickers) if tickers else 'No active watchlist tickers'}
+
+News and sentiment this week:
+{news_context}
+
+Structure your digest as:
+1. MACRO PULSE (2 sentences on the macro backdrop)
+2. SECTOR SIGNALS (one paragraph each for: AI Cybersecurity, Automotive Tech, Supply Chain)
+3. WATCHLIST MOVERS (which tickers had notable signal this week and why)
+4. WHAT TO WATCH NEXT WEEK (2-3 specific things)
+
+Write the full digest now."""
+
         try:
-            full_text = synthesize_material_change(system_prompt, context, max_tokens=1000)
+            full_text = call_claude_sonnet(system_prompt, user_prompt, max_tokens=1000)
         except Exception as e:
-            full_text = f"Weekly digest unavailable: {e}. Raw scan count: {len(scans)}."
+            full_text = f"Weekly digest generation failed: {e}. Context: {news_context[:500]}"
 
         existing = (
             session.query(WeeklyDigest)
