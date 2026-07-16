@@ -44,10 +44,61 @@ SessionLocal = sessionmaker(bind=_engine)
 CONGRESS_BASE_URL = "https://api.congress.gov/v3"
 HOUSE_DISCLOSURE_BASE = "https://disclosures.house.gov"
 HOUSE_DISCLOSURE_SEARCH = "https://disclosures.house.gov/FinancialDisclosure/ViewMemberSearchResult"
-# GitHub raw JSON — direct parses of official disclosure PDFs (no API, no rate limits)
-SENATE_GITHUB_DATA_BASE = "https://raw.githubusercontent.com/timothycarambat/senate-stock-watcher-data/master/data"
-HOUSE_GITHUB_RAW_URL = "https://raw.githubusercontent.com/jldec/house-stock-watcher-data/main/data/all_transactions.json"
+SENATE_EFTS_SEARCH = "https://efts.senate.gov/LATEST/search-index"
 USER_AGENT = "MarketLens/1.0 (compliance; omniaj@aol.com)"
+
+# House & Senate committee system codes to human-readable names
+COMMITTEE_SYSTEM_CODE_MAP = {
+    # House committees
+    "hsag00": "House Committee on Agriculture",
+    "hsap00": "House Committee on Appropriations",
+    "hsas00": "House Committee on Armed Services",
+    "hsba00": "House Committee on Financial Services",
+    "hsbu00": "House Committee on the Budget",
+    "hsed00": "House Committee on Education and the Workforce",
+    "hseg00": "House Committee on Energy and Commerce",
+    "hsfa00": "House Committee on Foreign Affairs",
+    "hsha00": "House Committee on Homeland Security",
+    "hshm00": "House Committee on House Administration",
+    "hsii00": "House Committee on Natural Resources",
+    "hsii13": "House Subcommittee on Federal Lands",
+    "hsif00": "House Committee on Infrastructure and Transportation",
+    "hlig00": "House Permanent Select Committee on Intelligence",
+    "hsjp00": "House Committee on the Judiciary",
+    "hsog00": "House Committee on Oversight and Accountability",
+    "hsru00": "House Committee on Rules",
+    "hssm00": "House Committee on Small Business",
+    "hspw00": "House Committee on Transportation and Infrastructure",
+    "hsvr00": "House Committee on Veterans' Affairs",
+    "hswm00": "House Committee on Ways and Means",
+    "hsso00": "House Committee on Science, Space, and Technology",
+    # Senate committees
+    "ssaf00": "Senate Committee on Agriculture, Nutrition, and Forestry",
+    "ssap00": "Senate Committee on Appropriations",
+    "ssas00": "Senate Committee on Armed Services",
+    "ssbk00": "Senate Committee on Banking, Housing, and Urban Affairs",
+    "ssbu00": "Senate Committee on the Budget",
+    "sscm00": "Senate Committee on Commerce, Science, and Transportation",
+    "sseg00": "Senate Committee on Energy and Natural Resources",
+    "ssev00": "Senate Committee on Environment and Public Works",
+    "ssfi00": "Senate Committee on Finance",
+    "ssfr00": "Senate Committee on Foreign Relations",
+    "ssgov": "Senate Committee on Homeland Security and Governmental Affairs",
+    "sshr00": "Senate Committee on Health, Education, Labor, and Pensions",
+    "ssju00": "Senate Committee on the Judiciary",
+    "ssra00": "Senate Committee on Rules and Administration",
+    "sssb00": "Senate Committee on Small Business and Entrepreneurship",
+    "ssva00": "Senate Committee on Veterans' Affairs",
+}
+
+# House Clerk lobbying via Azure Elastic
+LOBBYING_AZURE_URL = "https://app-pub-pri-elastic.azurewebsites.net/search"
+LOBBYING_AZURE_HEADERS = {
+    "Content-Type": "application/json",
+    "Origin": "https://disclosures.house.gov",
+    "Referer": "https://disclosures.house.gov/",
+    "User-Agent": USER_AGENT,
+}
 
 
 def _utc_today() -> date:
@@ -59,7 +110,7 @@ def _get_session() -> Session:
 
 
 # ---------------------------------------------------------------------------
-# House Clerk & Senate eFD Search — official government disclosure sources (no FMP)
+# House Clerk & Senate EFTS — official government disclosure sources (no FMP)
 # ---------------------------------------------------------------------------
 
 
@@ -145,375 +196,495 @@ def _get_or_create_member(session: Session, member_id: str, name: str, chamber: 
     return member
 
 
-def _ensure_or_create_member(
-    session: Session, name: str, chamber: str, bioguide: str = ""
-) -> CongressMember:
-    """Ensure a CongressMember exists; use bioguide as member_id when provided."""
-    member_id = (bioguide or name or "").strip() or "Unknown"
-    return _get_or_create_member(session, member_id=member_id, name=name or member_id, chamber=chamber)
-
-
-def _parse_house_github_record(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Map House GitHub JSON record to trade fields. Returns None if missing ticker or date."""
-    ticker = (rec.get("ticker") or rec.get("symbol") or "").strip().replace(" ", "")
-    if not ticker or ticker in ("--", ""):
-        return None
-    trans_date = rec.get("transaction_date") or rec.get("disclosure_date") or rec.get("date") or ""
-    disclosure_date = rec.get("disclosure_date") or rec.get("transaction_date") or rec.get("filing_date") or trans_date
-    trade_date = _safe_date(trans_date) or _parse_senate_date(trans_date)
-    if not trade_date:
-        return None
-    member = (rec.get("representative") or rec.get("member_name") or rec.get("name") or "").strip() or "Unknown"
-    trans_type = (rec.get("type") or rec.get("transaction_type") or "disclosure").strip().lower()
-    return {
-        "member_name": member,
-        "ticker": ticker,
-        "company_name": (rec.get("asset_description") or rec.get("company") or rec.get("asset") or "").strip() or ticker,
-        "transaction_type": trans_type or "disclosure",
-        "transaction_date": trans_date,
-        "disclosure_date": disclosure_date,
-        "trade_date": trade_date,
-        "disclosure_d": _safe_date(disclosure_date) or _parse_senate_date(disclosure_date) or trade_date,
-    }
-
-
 def ingest_house_disclosures(limit: int = 500) -> None:
     """
-    Ingest House STOCK Act disclosures. Tries GitHub raw JSON first (jldec/house-stock-watcher-data);
-    on 404 or parse failure falls back to House Clerk disclosure portal scraping.
-    Dedup on member + ticker + transaction_date + type. Filter last 90 days, skip missing tickers.
+    House STOCK Act PTR and financial disclosures via yearly zip files.
+
+    Confirmed working zip URLs:
+    - https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip
+
+    Zip contains {year}FD.xml with <FinancialDisclosure><Member> elements.
+    Each Member has: First, Last, FilingType, StateDst, Year, FilingDate, DocID.
+    FilingType P = Periodic Transaction Report (PTR) — stock trades.
+    DocID builds PDF URL: public_disc/ptr-pdfs/{year}/{DocID}.pdf
+
+    We store all PTR filings (FilingType=P) as CongressTrade records.
+    Individual PDF parsing for ticker extraction is a future enhancement.
     """
-    today = _utc_today()
-    cutoff = today - timedelta(days=90)
-    headers = {"User-Agent": USER_AGENT}
-    session = _get_session()
-    inserted = 0
+    import requests
+    import zipfile
+    import io
+    from xml.etree import ElementTree as ET
 
-    try:
-        resp = requests.get(HOUSE_GITHUB_RAW_URL, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-            except Exception:
-                data = None
-            if isinstance(data, list) and len(data) > 0:
-                for rec in data:
-                    if not isinstance(rec, dict):
-                        continue
-                    row = _parse_house_github_record(rec)
-                    if not row or row["trade_date"] < cutoff:
-                        continue
-                    trade_id = f"house_gh_{row['member_name']}_{row['ticker']}_{row['trade_date'].isoformat()}_{row['transaction_type']}".replace(" ", "_")
-                    if session.query(CongressTrade).filter_by(trade_id=trade_id).first():
-                        continue
-                    _get_or_create_member(session, member_id=row["member_name"], name=row["member_name"], chamber="house")
-                    session.add(CongressTrade(
-                        trade_id=trade_id,
-                        member_id=row["member_name"],
-                        ticker=row["ticker"],
-                        company_name=row["company_name"],
-                        sector=None,
-                        transaction_type=row["transaction_type"][:50],
-                        amount_range_low=None,
-                        amount_range_high=None,
-                        trade_date=row["trade_date"],
-                        disclosure_date=row["disclosure_d"],
-                        days_to_disclose=(row["disclosure_d"] - row["trade_date"]).days if row["disclosure_d"] and row["trade_date"] else None,
-                        committee_correlated=False,
-                        matching_committees=None,
-                        cluster_flag=False,
-                        source="house_github",
-                    ))
-                    inserted += 1
-                    if inserted >= limit:
-                        break
-                session.commit()
-                if inserted:
-                    print(f"[Congress] House: inserted {inserted} trades (GitHub).")
-                return
-            # else: not a list or empty — fall through to Clerk
-        # GitHub 404 or bad response — fall back to House Clerk
-        _ingest_house_disclosures_clerk(session, limit, cutoff)
-    finally:
-        session.close()
+    base_url = "https://disclosures-clerk.house.gov"
+    headers = {
+        "User-Agent": USER_AGENT
+    }
 
-
-def _ingest_house_disclosures_clerk(session: Session, limit: int, cutoff: Optional[date] = None) -> None:
-    """Fallback: ingest House PTR via House Clerk disclosure portal (scrape + XML parse)."""
-    resp = _http_get(HOUSE_DISCLOSURE_SEARCH)
-    if not resp or not resp.text:
-        print("[Congress] House disclosure search page not available (check URL/User-Agent).")
-        return
-
-    soup = BeautifulSoup(resp.text, "lxml")
-    links: List[str] = []
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
-        text = (a.get_text() or "").strip()
-        if "PTR" in text.upper() or "periodic" in text.lower():
-            full_url = urljoin(HOUSE_DISCLOSURE_BASE, href)
-            if full_url not in links and (".xml" in full_url or "ViewDocument" in full_url or "FinancialDisclosure" in full_url):
-                links.append(full_url)
-    for row in soup.find_all("tr"):
-        if "PTR" not in (row.get_text() or "").upper():
-            continue
-        for a in row.find_all("a", href=True):
-            full_url = urljoin(HOUSE_DISCLOSURE_BASE, a["href"])
-            if full_url not in links:
-                links.append(full_url)
-
-    links = links[:limit]
-    if not links:
-        print("[Congress] No House PTR disclosure links found on search page.")
-        return
-
-    inserted = 0
-    for doc_url in links:
-        member_name = "Unknown"
-        doc_resp = _http_get(doc_url)
-        if not doc_resp or not doc_resp.text:
-            continue
-        if "<?xml" in doc_resp.text or "<Transaction" in doc_resp.text or "<transaction" in doc_resp.text:
-            xml_text = doc_resp.text
-        else:
-            soup_d = BeautifulSoup(doc_resp.text, "lxml")
-            for h in soup_d.find_all(["h1", "h2", "span", "div"]):
-                t = (h.get_text() or "").strip()
-                if t and len(t) < 100 and ("Representative" in t or "Member" in t):
-                    member_name = re.sub(r"Representative|Member|Congress", "", t, flags=re.I).strip() or "Unknown"
-                    break
-            xml_link = soup_d.find("a", href=re.compile(r"\.xml$", re.I))
-            if not xml_link or not xml_link.get("href"):
-                continue
-            xml_url = urljoin(doc_url, xml_link["href"])
-            xml_resp = _http_get(xml_url)
-            if not xml_resp or not xml_resp.text:
-                continue
-            xml_text = xml_resp.text
-
-        trades = _parse_house_xml_for_trades(xml_text, member_name or "Unknown")
-        for item in trades:
-            trade_date = _safe_date(item.get("transaction_date"))
-            if cutoff and trade_date and trade_date < cutoff:
-                continue
-            trade_id = f"house_{member_name}_{item.get('ticker','')}_{item.get('transaction_date','')}_{item.get('disclosure_date','')}".replace(" ", "_")
-            if not trade_id or trade_id == "house_Unknown__":
-                trade_id = f"house_{doc_url}_{inserted}"
-            if session.query(CongressTrade).filter_by(trade_id=trade_id).first():
-                continue
-            member_name = (item.get("member_name") or "Unknown").strip()
-            _get_or_create_member(session, member_id=member_name, name=member_name, chamber="house")
-            session.add(CongressTrade(
-                trade_id=trade_id,
-                member_id=member_name,
-                ticker=item.get("ticker") or "",
-                company_name=item.get("company_name") or "",
-                sector=None,
-                transaction_type=(item.get("transaction_type") or "").lower() or "unknown",
-                amount_range_low=item.get("amount_low"),
-                amount_range_high=item.get("amount_high"),
-                trade_date=_safe_date(item.get("transaction_date")),
-                disclosure_date=_safe_date(item.get("disclosure_date")),
-                days_to_disclose=_compute_days_to_disclose(item.get("transaction_date"), item.get("disclosure_date")),
-                committee_correlated=False,
-                matching_committees=None,
-                cluster_flag=False,
-                source="house_clerk",
-            ))
-            inserted += 1
-    session.commit()
-    if inserted:
-        print(f"[Congress] House: inserted {inserted} trades (Clerk fallback).")
-
-
-def _parse_senate_date(s: str) -> Optional[date]:
-    """Parse MM/DD/YYYY from Senate GitHub JSON."""
-    if not s or len(s) < 10:
-        return None
-    try:
-        return datetime.strptime(s.strip()[:10], "%m/%d/%Y").date()
-    except ValueError:
-        return None
-
-
-def ingest_senate_disclosures(limit: int = 10000) -> None:
-    """
-    Pull Senate STOCK Act disclosures from timothycarambat/senate-stock-watcher-data.
-    Constructs per-date URLs directly — no GitHub API directory listing.
-    URL pattern: .../data/transaction_report_for_{MM}_{DD}_{YYYY}.json
-    """
-    base_url = f"{SENATE_GITHUB_DATA_BASE}/transaction_report_for_{{month}}_{{day}}_{{year}}.json"
-    headers = {"User-Agent": USER_AGENT}
-
-    end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=90)
-    cutoff = start_date.date()
+    current_year = datetime.now(timezone.utc).year
+    years_to_fetch = [current_year, current_year - 1]
 
     inserted = 0
     skipped = 0
-    files_found = 0
-    files_missing = 0
 
-    session = _get_session()
-    try:
-        current = start_date
-        while current <= end_date:
-            month = current.strftime("%m")
-            day = current.strftime("%d")
-            year = current.strftime("%Y")
-            url = base_url.format(month=month, day=day, year=year)
+    for year in years_to_fetch:
+        zip_url = f"{base_url}/public_disc/financial-pdfs/{year}FD.zip"
+        print(f"[House] Fetching {year} zip: {zip_url}")
 
+        try:
+            resp = requests.get(zip_url, headers=headers, timeout=30)
+            print(f"[House] {year} zip status: {resp.status_code} | {len(resp.content)} bytes")
+
+            if resp.status_code != 200:
+                print(f"[House] {year} zip not available — skipping")
+                continue
+
+            z = zipfile.ZipFile(io.BytesIO(resp.content))
+            xml_files = [n for n in z.namelist() if n.lower().endswith(".xml")]
+
+            if not xml_files:
+                print(f"[House] {year} zip has no XML files")
+                continue
+
+            xml_content = z.read(xml_files[0]).decode("utf-8", errors="replace")
+            root = ET.fromstring(xml_content)
+            members = root.findall("Member")
+            print(f"[House] {year}: {len(members)} member records in XML")
+
+            session = _get_session()
             try:
-                resp = requests.get(url, headers=headers, timeout=15)
+                for member in members:
+                    try:
+                        filing_type = (member.findtext("FilingType") or "").strip()
 
-                if resp.status_code == 404:
-                    files_missing += 1
-                    current += timedelta(days=1)
-                    continue
-
-                if resp.status_code != 200:
-                    print(f"[Senate] Unexpected status {resp.status_code} for {url}")
-                    current += timedelta(days=1)
-                    continue
-
-                try:
-                    senators = resp.json()
-                except Exception:
-                    current += timedelta(days=1)
-                    continue
-
-                if not isinstance(senators, list):
-                    current += timedelta(days=1)
-                    continue
-
-                files_found += 1
-                file_date = current.date()
-
-                for senator in senators:
-                    if not isinstance(senator, dict):
-                        continue
-                    first = (senator.get("first_name") or "").strip()
-                    last = (senator.get("last_name") or "").strip()
-                    member_name = f"{first} {last}".strip() or "Unknown"
-                    bioguide = (senator.get("bioguide") or "").strip()
-                    date_received = senator.get("date_recieved") or ""
-                    disclosure_d = _parse_senate_date(date_received) or file_date
-
-                    for t in senator.get("transactions") or []:
-                        if not isinstance(t, dict):
-                            continue
-                        try:
-                            ticker = (t.get("ticker") or "").strip().replace(" ", "").upper()
-                            if not ticker or ticker in ("--", "N/A", ""):
-                                skipped += 1
-                                continue
-
-                            raw_date = t.get("transaction_date") or ""
-                            if not raw_date:
-                                skipped += 1
-                                continue
-
-                            trade_date = None
-                            for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
-                                try:
-                                    trade_date = datetime.strptime(raw_date[:10], fmt).date()
-                                    break
-                                except ValueError:
-                                    continue
-                            if not trade_date or trade_date < cutoff:
-                                skipped += 1
-                                continue
-
-                            transaction_type = (t.get("type") or "unknown").strip()[:50]
-                            member = _ensure_or_create_member(
-                                session=session,
-                                name=member_name,
-                                chamber="senate",
-                                bioguide=bioguide,
-                            )
-                            member_id = member.member_id
-
-                            existing = session.query(CongressTrade).filter_by(
-                                member_id=member_id,
-                                ticker=ticker,
-                                trade_date=trade_date,
-                                transaction_type=transaction_type,
-                            ).first()
-                            if existing:
-                                skipped += 1
-                                continue
-
-                            trade_id = f"senate_gh_{member_id}_{ticker}_{trade_date.isoformat()}_{transaction_type}".replace(" ", "_")
-                            session.add(CongressTrade(
-                                trade_id=trade_id,
-                                member_id=member_id,
-                                ticker=ticker,
-                                company_name=(t.get("asset_description") or "").strip() or ticker,
-                                sector=None,
-                                transaction_type=transaction_type,
-                                amount_range_low=None,
-                                amount_range_high=None,
-                                trade_date=trade_date,
-                                disclosure_date=disclosure_d,
-                                days_to_disclose=(disclosure_d - trade_date).days if disclosure_d and trade_date else None,
-                                committee_correlated=False,
-                                matching_committees=None,
-                                cluster_flag=False,
-                                source="senate_github",
-                            ))
-                            inserted += 1
-
-                        except Exception as e:
-                            print(f"[Senate] Transaction error: {e} — {t}")
+                        # Only process PTR filings (P = Periodic Transaction Report)
+                        if filing_type != "P":
                             skipped += 1
+                            continue
+
+                        first = (member.findtext("First") or "").strip()
+                        last = (member.findtext("Last") or "").strip()
+                        member_name = f"{first} {last}".strip()
+                        state_dst = (member.findtext("StateDst") or "").strip()
+                        filing_date_str = (member.findtext("FilingDate") or "").strip()
+                        doc_id = (member.findtext("DocID") or "").strip()
+                        filing_year = (member.findtext("Year") or str(year)).strip()
+
+                        if not member_name or not doc_id:
+                            skipped += 1
+                            continue
+
+                        # Parse filing date
+                        filing_date = None
+                        for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+                            try:
+                                filing_date = datetime.strptime(filing_date_str, fmt).date()
+                                break
+                            except ValueError:
+                                continue
+
+                        if not filing_date:
+                            skipped += 1
+                            continue
+
+                        # Build PDF URL for this PTR
+                        pdf_url = f"{base_url}/public_disc/ptr-pdfs/{filing_year}/{doc_id}.pdf"
+
+                        # Deterministic trade ID for dedup
+                        trade_id = f"house_ptr_{filing_year}_{doc_id}"
+
+                        # Check existing
+                        existing = (
+                            session.query(CongressTrade)
+                            .filter_by(trade_id=trade_id)
+                            .first()
+                        )
+                        if existing:
+                            skipped += 1
+                            continue
+
+                        # Ensure or create member by name (no stable member_id in FD XML)
+                        member_row = (
+                            session.query(CongressMember)
+                            .filter_by(name=member_name, chamber="house")
+                            .first()
+                        )
+                        if not member_row:
+                            synthetic_id = f"house_name::{member_name}"
+                            member_row = CongressMember(
+                                member_id=synthetic_id,
+                                name=member_name,
+                                chamber="house",
+                            )
+                            session.add(member_row)
+                            session.flush()
+
+                        trade = CongressTrade(
+                            trade_id=trade_id,
+                            member_id=member_row.member_id,
+                            ticker="PTR_PENDING",
+                            company_name=f"House PTR — {pdf_url}",
+                            sector=None,
+                            transaction_type="disclosure",
+                            amount_range_low=None,
+                            amount_range_high=None,
+                            trade_date=filing_date,
+                            disclosure_date=filing_date,
+                            days_to_disclose=0,
+                            committee_correlated=False,
+                            matching_committees=None,
+                            cluster_flag=False,
+                            source="house_fd_zip",
+                        )
+                        session.add(trade)
+                        inserted += 1
+
+                    except Exception as e:
+                        print(f"[House] Member parse error: {e}")
+                        skipped += 1
+                        continue
+
+                session.commit()
+                print(f"[House] {year} committed — inserted so far: {inserted}")
+            finally:
+                session.close()
+
+        except Exception as e:
+            print(f"[House] {year} failed: {e}")
+            continue
+
+    print(f"[House] Complete — Inserted: {inserted} | Skipped: {skipped}")
+
+
+def _ingest_house_from_zip(year: int) -> None:
+    """
+    Diagnostic helper: download House annual PTR ZIP(s) and print basic info.
+
+    URL patterns (subject to change):
+    - PTR ZIP: https://disclosures.house.gov/public_disc/ptr-pdfs/{year}PTR.zip
+    - Financial disclosure ZIP: https://disclosures.house.gov/public_disc/financial-pdfs/{year}FD.zip
+    """
+    import io
+    import zipfile
+
+    ptr_url = f"https://disclosures.house.gov/public_disc/ptr-pdfs/{year}PTR.zip"
+    fd_url = f"https://disclosures.house.gov/public_disc/financial-pdfs/{year}FD.zip"
+
+    for url in (ptr_url, fd_url):
+        print(f"[House ZIP] Trying: {url}")
+        try:
+            resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=60)
+            print(f"[House ZIP] Status: {resp.status_code}, size={len(resp.content)} bytes")
+            if resp.status_code == 200 and len(resp.content) > 1024:
+                try:
+                    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                        names = zf.namelist()
+                        print(f"[House ZIP] Files in ZIP (first 10): {names[:10]}")
+                except Exception as e:
+                    print(f"[House ZIP] Failed to read ZIP from {url}: {e}")
+                # For now, stop after first successful ZIP; parsing can be added later.
+                return
+        except Exception as e:
+            print(f"[House ZIP] Request failed for {url}: {e}")
+
+    print("[House ZIP] All ZIP attempts failed.")
+
+
+def ingest_senate_disclosures():
+    """
+    Senate PTR disclosures via Playwright (real browser).
+    Server blocks requests-based calls to /search/report/data/ — Playwright bypasses this.
+    """
+    import asyncio
+    from playwright.async_api import async_playwright
+    import re
+    from datetime import datetime, timedelta
+    from market_lens.database.models import CongressTrade, CongressMember
+
+    base_url = "https://efdsearch.senate.gov"
+    inserted = 0
+    skipped = 0
+    captured_batches = []
+
+    async def _run():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+
+            # Intercept all responses from the data endpoint
+            async def handle_response(response):
+                if "search/report/data" in response.url:
+                    try:
+                        body = await response.json()
+                        rows = body.get("data", [])
+                        total = body.get("recordsFiltered", 0)
+                        print(f"[Senate] Captured batch: {len(rows)} rows | total: {total}")
+                        captured_batches.append({"rows": rows, "total": total})
+                    except Exception as e:
+                        print(f"[Senate] Response parse error: {e}")
+
+            page.on("response", handle_response)
+
+            # Step 1 — consent
+            print("[Senate] Loading consent page...")
+            await page.goto(f"{base_url}/search/home/", timeout=30000)
+            await page.wait_for_timeout(2000)
+
+            await page.evaluate("""
+                () => {
+                    const cb = document.querySelector('input[type="checkbox"]');
+                    if (cb) {
+                        const setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'checked'
+                        ).set;
+                        setter.call(cb, true);
+                        cb.dispatchEvent(new Event('change', {bubbles: true}));
+                        cb.dispatchEvent(new Event('click', {bubbles: true}));
+                    }
+                }
+            """)
+            await page.wait_for_timeout(1000)
+
+            await page.evaluate("""
+                () => {
+                    const btns = Array.from(document.querySelectorAll('button, input[type=submit]'));
+                    const btn = btns.find(b =>
+                        (b.textContent || b.value || '').toLowerCase().includes('agree') ||
+                        (b.textContent || b.value || '').toLowerCase().includes('submit') ||
+                        (b.textContent || b.value || '').toLowerCase().includes('i agree')
+                    );
+                    if (btn) btn.click();
+                }
+            """)
+            await page.wait_for_load_state("networkidle", timeout=15000)
+            await page.wait_for_timeout(2000)
+            print(f"[Senate] After consent: {page.url}")
+
+            # Step 2 — set PTR filter and date range
+            end_date = datetime.utcnow()
+            start_date = end_date - timedelta(days=90)
+            start_str = start_date.strftime("%m/%d/%Y")
+            end_str = end_date.strftime("%m/%d/%Y")
+
+            await page.evaluate(f"""
+                () => {{
+                    // Check PTR checkbox (value=11)
+                    document.querySelectorAll('input[name="report_type"]').forEach(cb => {{
+                        cb.checked = cb.value === '11';
+                        cb.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    }});
+
+                    // Set date range
+                    const setVal = (sel, val) => {{
+                        const el = document.querySelector(sel);
+                        if (el) {{
+                            const setter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value'
+                            ).set;
+                            setter.call(el, val);
+                            el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        }}
+                    }};
+                    setVal('input[name="submitted_start_date"]', '{start_str}');
+                    setVal('input[name="submitted_end_date"]', '{end_str}');
+                }}
+            """)
+            await page.wait_for_timeout(1000)
+
+            # Step 3 — click Search Reports
+            await page.evaluate("""
+                () => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const btn = btns.find(b => b.textContent.trim().includes('Search Reports'));
+                    if (btn) btn.click();
+                }
+            """)
+            await page.wait_for_load_state("networkidle", timeout=20000)
+            await page.wait_for_timeout(3000)
+
+            print(f"[Senate] Search triggered. Batches captured so far: {len(captured_batches)}")
+
+            # Step 4 — paginate through results by clicking Next
+            # DataTables pagination fires new /search/report/data/ requests automatically
+            page_num = 1
+            while True:
+                if not captured_batches:
+                    print("[Senate] No data captured on this page")
+                    break
+
+                last_batch = captured_batches[-1]
+                total = last_batch.get("total", 0)
+                rows_so_far = sum(len(b["rows"]) for b in captured_batches)
+
+                print(f"[Senate] Page {page_num}: rows so far {rows_so_far} / {total}")
+
+                if rows_so_far >= int(total):
+                    break
+
+                # Click Next button
+                next_clicked = await page.evaluate("""
+                    () => {
+                        const next = document.querySelector('#fdsearch_next, .next, [id*="next"]');
+                        if (next && !next.classList.contains('disabled')) {
+                            next.click();
+                            return true;
+                        }
+                        return false;
+                    }
+                """)
+
+                if not next_clicked:
+                    print("[Senate] No Next button or pagination complete")
+                    break
+
+                await page.wait_for_load_state("networkidle", timeout=15000)
+                await page.wait_for_timeout(2000)
+                page_num += 1
+
+                if page_num > 50:  # Safety limit
+                    break
+
+            await browser.close()
+
+    # Run the async function
+    asyncio.run(_run())
+
+    print(f"[Senate] Total batches captured: {len(captured_batches)}")
+
+    if not captured_batches:
+        print("[Senate] No data captured — server may still be blocking or no PTR filings in range")
+        return
+
+    # Insert captured rows into database
+    all_rows = []
+    for batch in captured_batches:
+        all_rows.extend(batch["rows"])
+
+    print(f"[Senate] Processing {len(all_rows)} total rows...")
+
+    db_session = _get_session()
+    try:
+        for row in all_rows:
+            try:
+                if len(row) < 5:
+                    skipped += 1
+                    continue
+
+                first_name = str(row[0]).strip() if row[0] else ""
+                last_name = str(row[1]).strip() if row[1] else ""
+                member_name = f"{first_name} {last_name}".strip()
+                report_html = str(row[3]) if row[3] else ""
+                date_str = str(row[4]).strip() if row[4] else ""
+
+                url_match = re.search(r'href=["\']([^"\']+)["\']', report_html)
+                report_path = url_match.group(1) if url_match else ""
+                filing_id = report_path.strip("/").split("/")[-1] if report_path else ""
+
+                if not filing_id or not member_name:
+                    skipped += 1
+                    continue
+
+                disclosure_date = None
+                for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+                    try:
+                        disclosure_date = datetime.strptime(date_str[:10], fmt)
+                        break
+                    except ValueError:
+                        continue
+
+                if not disclosure_date:
+                    skipped += 1
+                    continue
+
+                trade_id = f"senate_efdsearch_{filing_id}"
+
+                existing = db_session.query(CongressTrade).filter_by(
+                    trade_id=trade_id
+                ).first()
+                if existing:
+                    skipped += 1
+                    continue
+
+                member_row = db_session.query(CongressMember).filter_by(
+                    name=member_name, chamber="senate"
+                ).first()
+                if not member_row:
+                    member_row = CongressMember(
+                        member_id=f"senate_name::{member_name}",
+                        name=member_name,
+                        chamber="senate"
+                    )
+                    db_session.add(member_row)
+                    db_session.flush()
+
+                trade = CongressTrade(
+                    trade_id=trade_id,
+                    member_id=member_row.member_id,
+                    ticker="PTR_PENDING",
+                    company_name=f"Senate PTR — {base_url}{report_path}",
+                    transaction_type="disclosure",
+                    trade_date=disclosure_date.date(),
+                    disclosure_date=disclosure_date.date(),
+                    days_to_disclose=0,
+                    committee_correlated=False,
+                    cluster_flag=False,
+                    source="senate_efdsearch"
+                )
+                db_session.add(trade)
+                inserted += 1
 
             except Exception as e:
-                print(f"[Senate] File error for {current.date()}: {e}")
+                print(f"[Senate] Row error: {e}")
+                skipped += 1
+                continue
 
-            current += timedelta(days=1)
-
-        session.commit()
+        db_session.commit()
     finally:
-        session.close()
+        db_session.close()
 
-    print(f"[Senate] Files found: {files_found} | Files missing (normal): {files_missing}")
-    print(f"[Senate] Inserted: {inserted} | Skipped: {skipped}")
-
-
-# ---------------------------------------------------------------------------
-# House Clerk lobbying via Azure Elastic (confirmed working)
-# ---------------------------------------------------------------------------
-
-LOBBYING_AZURE_URL = "https://app-pub-pri-elastic.azurewebsites.net/search"
-LOBBYING_AZURE_HEADERS = {
-    "Content-Type": "application/json",
-    "Origin": "https://disclosures.house.gov",
-    "Referer": "https://disclosures.house.gov/",
-    "User-Agent": USER_AGENT,
-}
+    print(f"[Senate] Complete — Inserted: {inserted} | Skipped: {skipped}")
 
 
 def ingest_lobbying_registrations() -> None:
     """
     Pull lobbying disclosure registrations via House Clerk Azure Elastic endpoint.
     Confirmed working: POST https://app-pub-pri-elastic.azurewebsites.net/search
-    index: lobbying-disclosures
+    index: lobbying-disclosures. Filters to last 2 years and stops when pages are all old.
     """
+    import requests
+
     current_year = datetime.now(timezone.utc).year
     inserted = 0
     skipped = 0
     page_num = 0
     page_size = 100
+    consecutive_old_pages = 0
+
+    # Prefer sort by signedDate (exact submission time); API may 400 — fallback to reportYear for all pages.
+    sort_signed = [{"field": "signedDate", "order": "desc"}]
+    sort_report_year = [{"field": "reportYear", "order": "desc"}]
+    sort_to_use = sort_signed
 
     while True:
         payload = {
             "index": "lobbying-disclosures",
             "size": page_size,
             "from": page_num * page_size,
+            "sort": sort_to_use,
         }
 
         try:
             resp = requests.post(LOBBYING_AZURE_URL, json=payload, headers=LOBBYING_AZURE_HEADERS, timeout=30)
+            if resp.status_code == 400 and sort_to_use == sort_signed:
+                sort_to_use = sort_report_year
+                payload["sort"] = sort_report_year
+                resp = requests.post(LOBBYING_AZURE_URL, json=payload, headers=LOBBYING_AZURE_HEADERS, timeout=30)
+                if resp.status_code == 200:
+                    print("[Lobbying] signedDate sort not supported; using reportYear sort")
             print(f"[Lobbying] Page {page_num} status: {resp.status_code}")
 
             if resp.status_code != 200:
@@ -528,74 +699,147 @@ def ingest_lobbying_registrations() -> None:
             if not hits:
                 break
 
+            old_count_this_page = 0
+
             session = _get_session()
             try:
                 for hit in hits:
                     try:
-                        # Support both flat hit and _source-wrapped response
-                        src = hit.get("_source") or hit
-                        filing_id = str(hit.get("_id") or "")
-                        registration_id = filing_id or ""
-                        registrant_name = (src.get("registrantName") or (src.get("registrant") or {}).get("name") or (src.get("registrant") or {}).get("organizationName") or "").strip()
-                        client_name = (src.get("clientName") or (src.get("client") or {}).get("name") or "").strip()
-                        report_type = src.get("reportType", "")
-                        if isinstance(report_type, dict):
-                            report_type_str = report_type.get("description", "") or report_type.get("name", "") or ""
+                        filing_id = str(hit.get("_id", ""))
+                        registration_id = filing_id
+
+                        if not filing_id:
+                            skipped += 1
+                            continue
+
+                        source = hit.get("_source", {})
+
+                        # Registrant name
+                        registrant = source.get("registrant", {})
+                        registrant_name = (
+                            registrant.get("name")
+                            or registrant.get("organizationName")
+                            or f"{registrant.get('firstName', '')} {registrant.get('lastName', '')}".strip()
+                        ).strip()
+
+                        # Client name
+                        client = source.get("client", {})
+                        client_name = (client.get("name") or "").strip()
+
+                        # Report type
+                        report_type_obj = source.get("reportType", {})
+                        if isinstance(report_type_obj, dict):
+                            report_type_str = report_type_obj.get("description") or report_type_obj.get("name") or ""
                         else:
-                            report_type_str = str(report_type or "")
-                        report_year = src.get("reportYear", current_year)
-                        senate_id = str(src.get("senateId") or "")
-                        lobbyist_names = src.get("lobbyistNames") or src.get("lobbyists") or []
-                        if not isinstance(lobbyist_names, list):
-                            lobbyist_names = [str(lobbyist_names)] if lobbyist_names else []
+                            report_type_str = str(report_type_obj)
+
+                        # 2-year cutoff and filing_date from signedDate (exact submission time)
+                        signed_date_str = source.get("signedDate", "")
+                        filing_date_val = None
+
+                        if signed_date_str:
+                            try:
+                                signed_dt = datetime.fromisoformat(
+                                    signed_date_str.replace("Z", "+00:00")
+                                )
+                                cutoff = datetime.now(timezone.utc) - timedelta(days=730)
+                                if signed_dt < cutoff:
+                                    old_count_this_page += 1
+                                    skipped += 1
+                                    continue
+                                filing_date_val = signed_dt.date()
+                            except Exception:
+                                pass
+
+                        if filing_date_val is None:
+                            # Fallback to reportYear
+                            report_year = source.get("reportYear", str(current_year))
+                            report_year_int = int(report_year) if str(report_year).isdigit() else 0
+                            if report_year_int < current_year - 1:
+                                old_count_this_page += 1
+                                skipped += 1
+                                continue
+                            filing_date_val = date(report_year_int, 1, 1)
+
+                        # Senate ID
+                        senate_id = source.get("senateId", "")
+
+                        # Lobbyists
+                        lobbyists = source.get("lobbyists", [])
+                        lobbyist_names = ", ".join(
+                            [
+                                l.get("fullName")
+                                or f"{l.get('firstName', '')} {l.get('lastName', '')}".strip()
+                                for l in lobbyists
+                                if isinstance(l, dict)
+                            ]
+                        )
+
+                        # Issue areas as sector keywords (JSON list)
+                        issue_areas = source.get("issueAreaCodes", [])
+                        sector_keywords = [
+                            i.get("description", "")
+                            for i in issue_areas
+                            if isinstance(i, dict) and i.get("description")
+                        ]
 
                         if not registrant_name or not client_name:
                             skipped += 1
                             continue
 
-                        if not registration_id:
-                            skipped += 1
-                            continue
-
-                        existing = session.query(LobbyingRegistration).filter_by(
-                            registration_id=registration_id
-                        ).first()
-
+                        existing = (
+                            session.query(LobbyingRegistration)
+                            .filter_by(registration_id=registration_id)
+                            .first()
+                        )
                         if existing:
                             skipped += 1
                             continue
 
-                        report_year_int = int(report_year) if str(report_year).isdigit() else current_year
-                        filing_date_val = date(report_year_int, 1, 1)
                         reg = LobbyingRegistration(
                             registration_id=registration_id,
-                            filing_id=filing_id,
                             registrant_name=registrant_name,
                             client_name=client_name,
                             filing_date=filing_date_val,
                             covered_officials=None,
-                            sector_keywords=None,
-                            lobbying_activities={"report_type": report_type_str, "lobbyist_names": lobbyist_names},
+                            sector_keywords=sector_keywords or None,
+                            lobbying_activities={
+                                "report_type": report_type_str,
+                                "lobbyist_names": lobbyist_names,
+                                "senate_id": senate_id,
+                                "source": "house_clerk_elastic",
+                            },
                             committee_match=False,
                             flagged=False,
-                            senate_id=senate_id or None,
-                            source="house_clerk_elastic"
                         )
                         session.add(reg)
                         inserted += 1
-
                     except Exception as e:
                         print(f"[Lobbying] Row error: {hit.get('_id', 'unknown')} — {e}")
                         skipped += 1
                         continue
 
                 session.commit()
-                print(f"[Lobbying] Page {page_num} committed — running total inserted: {inserted}")
-
+                print(f"[Lobbying] Page {page_num} committed - running total inserted: {inserted}")
             finally:
                 session.close()
 
-            if (page_num + 1) * page_size >= total:
+            if old_count_this_page == len(hits):
+                consecutive_old_pages += 1
+                print(
+                    f"[Lobbying] All records on page {page_num} are older than {current_year - 1} "
+                    f"(consecutive old pages: {consecutive_old_pages})"
+                )
+            else:
+                consecutive_old_pages = 0
+
+            if consecutive_old_pages >= 3:
+                print(
+                    f"[Lobbying] Reached {consecutive_old_pages} consecutive old pages - stopping pagination at page {page_num}"
+                )
+                break
+
+            if (page_num + 1) * page_size >= (total or 0):
                 break
 
             page_num += 1
@@ -604,7 +848,7 @@ def ingest_lobbying_registrations() -> None:
             print(f"[Lobbying] Request error: {e}")
             break
 
-    print(f"[Lobbying] Complete — Inserted: {inserted} | Skipped: {skipped}")
+    print(f"[Lobbying] Complete - Inserted: {inserted} | Skipped: {skipped}")
 
 
 def _safe_date(value: Optional[str]) -> Optional[date]:
@@ -697,114 +941,106 @@ def update_member_committees(bioguide_ids: Iterable[str]) -> None:
         session.close()
 
 
-# Sectors we care about — mapped from committee names for hearing relevance
-_COMMITTEE_SECTOR_MAP = {
-    "intelligence": ["cybersecurity", "AI", "defense"],
-    "armed services": ["defense", "cybersecurity"],
-    "commerce": ["technology", "telecom", "AI"],
-    "banking": ["financials", "fintech"],
-    "finance": ["financials", "tax"],
-    "judiciary": ["antitrust", "technology"],
-    "energy": ["energy", "utilities"],
-    "transportation": ["automotive", "logistics"],
-    "homeland security": ["cybersecurity", "defense"],
-    "science": ["technology", "AI", "research"],
-}
+def update_hearing_schedule(
+    congress_number: int, chamber: str = "house"
+) -> None:
+    import time
 
-
-def update_hearing_schedule(congress_number: int = 119, chamber: Optional[str] = None) -> None:
-    """
-    Pull upcoming committee hearings from Congress.gov API v3 committee-meeting endpoint.
-    Stores ALL hearings; relevant_sectors set to matched sectors or empty list for non-matching.
-    """
-    if not config.CONGRESS_API_KEY:
-        print("[Hearings] CONGRESS_API_KEY not set — skipping.")
+    path = f"/committee-meeting/{congress_number}/{chamber}"
+    data = _congress_get(path)
+    if not data:
+        print(f"[Hearings] No data from Congress.gov for {chamber}")
         return
-
-    base = f"{CONGRESS_BASE_URL}/committee-meeting"
-    headers = {"User-Agent": USER_AGENT}
-    params_base = {"api_key": config.CONGRESS_API_KEY, "limit": 250, "format": "json"}
-
-    chambers = [chamber] if chamber else ["house", "senate"]
-    inserted = 0
-    skipped = 0
 
     session = _get_session()
     try:
-        for ch in chambers:
-            url = f"{base}/{congress_number}/{ch}"
-            try:
-                resp = requests.get(url, headers=headers, params=params_base, timeout=30)
-                print(f"[Hearings] {ch} status: {resp.status_code}")
+        meetings = data.get("committeeMeetings") or []
+        print(f"[Hearings] {chamber}: {len(meetings)} meetings from list endpoint")
+        inserted = 0
+        updated = 0
 
-                if resp.status_code != 200:
-                    print(f"[Hearings] {ch} failed: {resp.text[:200]}")
-                    continue
+        for m in meetings:
+            hearing_id = str(m.get("eventId") or m.get("meetingId") or "")
+            if not hearing_id:
+                continue
 
-                data = resp.json()
-                meetings = data.get("committeeMeetings") or []
-                print(f"[Hearings] {ch} meetings returned: {len(meetings)}")
+            detail_url = m.get("url", "")
+            src = {}
+            if detail_url:
+                try:
+                    detail_path = detail_url.split("/v3")[-1].split("?")[0]
+                    detail_data = _congress_get(detail_path)
+                    if detail_data:
+                        src = detail_data.get("committeeMeeting", {})
+                except Exception as e:
+                    print(f"[Hearings] Detail fetch error for {hearing_id}: {e}")
+                time.sleep(0.3)
 
-                for m in meetings:
-                    try:
-                        event_date_raw = m.get("date") or m.get("meetingDate") or ""
-                        if not event_date_raw:
-                            skipped += 1
-                            continue
+            # Extract committee name from systemCode lookup
+            committee_name = ""
+            committees = src.get("committees", [])
+            if committees and isinstance(committees, list):
+                system_code = committees[0].get("systemCode", "")
+                committee_name = COMMITTEE_SYSTEM_CODE_MAP.get(system_code, system_code)
 
-                        event_date = datetime.strptime(event_date_raw[:10], "%Y-%m-%d")
-                        event_date = event_date.replace(tzinfo=timezone.utc)
+            # Extract title — confirmed field is 'title' in detail response
+            hearing_title = (src.get("title") or "").strip().strip('"')
+            subject = hearing_title
 
-                        title = m.get("title") or m.get("description") or ""
-                        committees = m.get("committees") or []
-                        committee_name = committees[0].get("name", "") if committees else m.get("committeeName") or ""
+            # Extract date — confirmed field is 'date' in detail response
+            dt_str = src.get("date") or src.get("meetingDate") or m.get("updateDate")
+            hearing_dt = None
+            if dt_str:
+                try:
+                    hearing_dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                except Exception:
+                    hearing_dt = None
 
-                        relevant_sectors = []
-                        for keyword, sectors in _COMMITTEE_SECTOR_MAP.items():
-                            if keyword.lower() in committee_name.lower() or keyword.lower() in (title or "").lower():
-                                relevant_sectors.extend(sectors)
-                        relevant_sectors = list(set(relevant_sectors))  # store all hearings; empty list if no match
+            existing = (
+                session.query(CommitteeHearing)
+                .filter_by(hearing_id=hearing_id)
+                .first()
+            )
 
-                        hearing_id = str(m.get("eventId") or m.get("meetingId") or "")
-                        if not hearing_id:
-                            hearing_id = f"{ch}_{event_date_raw[:10]}_{(title or '')[:40]}".replace(" ", "_")
+            if existing:
+                if not existing.committee_name and committee_name:
+                    existing.committee_name = committee_name
+                if not existing.hearing_title and hearing_title:
+                    existing.hearing_title = hearing_title
+                if not existing.subject and subject:
+                    existing.subject = subject
+                if hearing_dt and (not existing.hearing_date or existing.hearing_date == existing.created_at):
+                    existing.hearing_date = hearing_dt
+                updated += 1
+            else:
+                relevant_sectors = None
+                cm = (
+                    session.query(CommitteeSectorMap)
+                    .filter_by(committee_name=committee_name)
+                    .first()
+                )
+                if cm and cm.jurisdiction_sectors:
+                    relevant_sectors = cm.jurisdiction_sectors
 
-                        existing = (
-                            session.query(CommitteeHearing)
-                            .filter_by(hearing_id=hearing_id)
-                            .first()
-                        )
-                        if existing:
-                            skipped += 1
-                            continue
-
-                        hearing = CommitteeHearing(
-                            hearing_id=hearing_id,
-                            committee_name=committee_name,
-                            chamber=ch,
-                            hearing_date=event_date,
-                            subject=title,
-                            hearing_title=title,
-                            topic_keywords=None,
-                            sector_relevance={"source": "congress.gov"} if relevant_sectors else None,
-                            relevant_sectors=relevant_sectors,
-                            relevant_watchlist_tickers=None,
-                            member_watch_window_triggered=False,
-                            alerted=False,
-                        )
-                        session.add(hearing)
-                        inserted += 1
-
-                    except Exception as e:
-                        print(f"[Hearings] Row error: {e}")
-                        skipped += 1
-                        continue
-
-            except Exception as e:
-                print(f"[Hearings] {ch} request failed: {e}")
+                hearing = CommitteeHearing(
+                    hearing_id=hearing_id,
+                    committee_name=committee_name,
+                    chamber=chamber,
+                    hearing_date=hearing_dt or datetime.now(timezone.utc),
+                    subject=subject,
+                    hearing_title=hearing_title,
+                    topic_keywords=None,
+                    sector_relevance={"source": "committee_sector_map"} if relevant_sectors else None,
+                    relevant_sectors=relevant_sectors,
+                    relevant_watchlist_tickers=None,
+                    member_watch_window_triggered=False,
+                    alerted=False,
+                )
+                session.add(hearing)
+                inserted += 1
 
         session.commit()
-        print(f"[Hearings] Inserted: {inserted}, Skipped: {skipped}")
+        print(f"[Hearings] {chamber}: {inserted} inserted, {updated} updated")
     finally:
         session.close()
 

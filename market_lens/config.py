@@ -55,6 +55,7 @@ EDGAR_BASE_URL = os.getenv("EDGAR_BASE_URL", "https://data.sec.gov")
 # -----------------------------------------------------------------------------
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
+MARKETAUX_API_KEY = os.getenv("MARKETAUX_API_KEY", "")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CONGRESS_API_KEY = os.getenv("CONGRESS_API_KEY", "")
@@ -88,7 +89,7 @@ DISPLAY_TIMEZONE = os.getenv("DISPLAY_TIMEZONE", "America/New_York")
 # Defaults align with current Anthropic model IDs; override via .env if needed.
 CLAUDE_SONNET_MODEL = os.getenv(
     "CLAUDE_SONNET_MODEL",
-    "claude-sonnet-5",
+    "claude-sonnet-4-20250514",
 )
 CLAUDE_HAIKU_MODEL = os.getenv(
     "CLAUDE_HAIKU_MODEL",

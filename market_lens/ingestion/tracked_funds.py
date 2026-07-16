@@ -40,7 +40,7 @@ _engine = create_engine(config.DATABASE_URL)
 SessionLocal = sessionmaker(bind=_engine)
 
 EDGAR_SEARCH_INDEX_URL = "https://efts.sec.gov/LATEST/search-index"
-ARK_TRADE_HISTORY_URL = "https://ark-funds.com/trade-history"
+# ARK Invest: ingested via EDGAR 13F (CIK 0001579982) like other funds; trade-history page returns 403.
 
 
 def _utc_now() -> datetime:
@@ -208,20 +208,39 @@ def _get_latest_13f_accession(cik: str) -> Optional[str]:
 
 
 def _fetch_13f_infotable_xml(cik: str, accession_number: str) -> Optional[str]:
-    """Fetch infotable.xml for a 13F-HR filing. accession_number has dashes e.g. 0002045724-25-000008."""
+    """
+    Fetch 13F-HR information table XML. Tries infotable.xml first; if missing,
+    uses accession index to find the XML file that contains infoTable (e.g. SALP_13FQ425.xml).
+    """
     acc_clean = accession_number.replace("-", "")
-    # CIK without leading zeros for URL path
     cik_num = cik.lstrip("0") or "0"
-    url = f"{SEC_ARCHIVES_BASE}/{cik_num}/{acc_clean}/infotable.xml"
+    base = f"{SEC_ARCHIVES_BASE}/{cik_num}/{acc_clean}"
     sess = _edgar_session()
+    # Try standard name first
+    url = f"{base}/infotable.xml"
     try:
         r = sess.get(url, timeout=30)
-        if r.status_code != 200:
-            return None
-        return r.text
+        if r.status_code == 200 and (r.text or "").strip():
+            return r.text
     except Exception as e:
         print(f"[TrackedFunds] EDGAR infotable fetch {url}: {e}")
-        return None
+    # Fallback: list files and fetch first XML that contains infoTable
+    try:
+        idx_url = f"{base}/index.json"
+        idx = sess.get(idx_url, timeout=30)
+        if idx.status_code != 200:
+            return None
+        data = idx.json()
+        items = (data.get("directory") or {}).get("item") or []
+        xml_files = [it["name"] for it in items if isinstance(it, dict) and (it.get("name") or "").endswith(".xml")]
+        for name in xml_files:
+            doc_url = f"{base}/{name}"
+            r = sess.get(doc_url, timeout=30)
+            if r.status_code == 200 and r.text and "infoTable" in r.text:
+                return r.text
+    except Exception as e:
+        print(f"[TrackedFunds] EDGAR 13F fallback fetch for {accession_number}: {e}")
+    return None
 
 
 def _parse_infotable_xml(xml_text: str) -> List[dict]:
@@ -354,198 +373,102 @@ def ingest_13f_positions_for_fund(fund: TrackedFund) -> None:
         session.close()
 
 
-def _sorted_quarters(quarters: Iterable[str]) -> List[str]:
-    def key(q: str):
-        try:
-            year, qtr = q.split("Q")
-            return (int(year), int(qtr))
-        except Exception:
-            return (0, 0)
-    return sorted(set(quarters), key=key)
-
-
 def recompute_fund_position_deltas(fund: TrackedFund) -> None:
     """
-    Compute quarter-over-quarter deltas for a fund's 13F positions.
-
-    Compares the two most recent quarters present in `fund_positions`:
-    - added: ticker present now, absent previously
-    - exited: ticker present previously, absent now
-    - increased / decreased: ticker in both, market_value change beyond a noise threshold
-    Writes results into FundPositionDelta (idempotent: clears prior deltas for the
-    current/previous quarter pair before inserting fresh ones).
+    Compute quarter-over-quarter position deltas for a single fund.
+    Compares current quarter vs previous quarter FundPosition rows.
     """
+    from market_lens.database.models import FundPosition, FundPositionDelta
+
     session = _get_session()
     try:
-        quarters = [
-            row[0]
-            for row in session.query(FundPosition.quarter)
+        quarters = (
+            session.query(FundPosition.quarter)
             .filter_by(fund_id=fund.id)
             .distinct()
+            .order_by(FundPosition.quarter.desc())
             .all()
-        ]
-        ordered = _sorted_quarters(quarters)
-        if len(ordered) < 2:
+        )
+        qs = [q[0] for q in quarters]
+
+        if len(qs) < 2:
+            print(f"[Funds] {fund.name}: only {len(qs)} quarter(s) — skipping deltas")
             return
-        current_q, previous_q = ordered[-1], ordered[-2]
+
+        current_q = qs[0]
+        prev_q = qs[1]
 
         current_positions = {
-            p.ticker: p
-            for p in session.query(FundPosition).filter_by(fund_id=fund.id, quarter=current_q).all()
+            p.ticker: p.shares
+            for p in session.query(FundPosition).filter_by(
+                fund_id=fund.id, quarter=current_q
+            ).all()
         }
-        previous_positions = {
-            p.ticker: p
-            for p in session.query(FundPosition).filter_by(fund_id=fund.id, quarter=previous_q).all()
+        prev_positions = {
+            p.ticker: p.shares
+            for p in session.query(FundPosition).filter_by(
+                fund_id=fund.id, quarter=prev_q
+            ).all()
         }
 
-        # Clear any previously computed deltas for this quarter pair to keep this idempotent.
-        session.query(FundPositionDelta).filter_by(
-            fund_id=fund.id, quarter=current_q, previous_quarter=previous_q
-        ).delete()
+        all_tickers = set(current_positions) | set(prev_positions)
+        inserted = 0
 
-        NOISE_THRESHOLD_PCT = 5.0  # ignore value swings smaller than this as noise
+        for ticker in all_tickers:
+            cur = current_positions.get(ticker)
+            prev = prev_positions.get(ticker)
 
-        for ticker, curr in current_positions.items():
-            prev = previous_positions.get(ticker)
-            if prev is None:
-                session.add(
-                    FundPositionDelta(
-                        fund_id=fund.id,
-                        ticker=ticker,
-                        quarter=current_q,
-                        previous_quarter=previous_q,
-                        change_type="added",
-                        size_change_pct=None,
-                        direction_changed=True,
-                        notes=f"New position: {curr.market_value:,.0f} market value.",
-                    )
-                )
-                continue
-
-            prev_value = prev.market_value or 0.0
-            curr_value = curr.market_value or 0.0
-            if prev_value <= 0:
-                pct_change = 100.0 if curr_value > 0 else 0.0
+            if cur and not prev:
+                change_type = "new"
+                size_change_pct = 100.0
+            elif prev and not cur:
+                change_type = "exited"
+                size_change_pct = -100.0
+            elif cur and prev:
+                pct = ((cur - prev) / prev) * 100
+                if pct > 10:
+                    change_type = "increased"
+                elif pct < -10:
+                    change_type = "reduced"
+                else:
+                    continue
+                size_change_pct = round(pct, 2)
             else:
-                pct_change = ((curr_value - prev_value) / prev_value) * 100.0
-
-            if abs(pct_change) < NOISE_THRESHOLD_PCT:
                 continue
 
-            change_type = "increased" if pct_change > 0 else "decreased"
-            session.add(
-                FundPositionDelta(
-                    fund_id=fund.id,
-                    ticker=ticker,
-                    quarter=current_q,
-                    previous_quarter=previous_q,
-                    change_type=change_type,
-                    size_change_pct=pct_change,
-                    direction_changed=False,
-                    notes=f"Market value {prev_value:,.0f} -> {curr_value:,.0f} ({pct_change:+.1f}%).",
-                )
-            )
-
-        for ticker, prev in previous_positions.items():
-            if ticker in current_positions:
+            existing = session.query(FundPositionDelta).filter_by(
+                fund_id=fund.id, ticker=ticker, quarter=current_q
+            ).first()
+            if existing:
                 continue
-            session.add(
-                FundPositionDelta(
-                    fund_id=fund.id,
-                    ticker=ticker,
-                    quarter=current_q,
-                    previous_quarter=previous_q,
-                    change_type="exited",
-                    size_change_pct=-100.0,
-                    direction_changed=True,
-                    notes=f"Position exited: was {prev.market_value:,.0f} market value in {previous_q}.",
-                )
+
+            delta = FundPositionDelta(
+                fund_id=fund.id,
+                ticker=ticker,
+                quarter=current_q,
+                previous_quarter=prev_q,
+                change_type=change_type,
+                size_change_pct=size_change_pct,
+                direction_changed=False,
+                notes=f"13F delta: {prev_q} → {current_q}",
             )
+            session.add(delta)
+            inserted += 1
 
         session.commit()
+        print(f"[Funds] {fund.name}: {inserted} delta rows inserted ({prev_q} → {current_q})")
     finally:
         session.close()
 
 
 def ingest_ark_daily_trades() -> None:
     """
-    Parse ARK's daily trade history CSV.
-
-    The ARK site exposes daily trades as downloadable CSV(s).
-    This function fetches the page, finds CSV links, downloads
-    the most recent file(s), and populates `ark_daily_trades`.
+    ARK Invest is ingested via EDGAR 13F (CIK 0001579982) in the standard flow
+    (ingest_13f_positions_for_fund). The former trade-history page (ark-funds.com)
+    returns 403; no separate daily-trade ingestion.
     """
-    try:
-        resp = requests.get(ARK_TRADE_HISTORY_URL, timeout=30)
-    except requests.exceptions.Timeout:
-        print(f"[TIMEOUT] ARK trade history request to {ARK_TRADE_HISTORY_URL} timed out after 30 seconds — skipping")
-        return
-    except requests.exceptions.RequestException as e:
-        print(f"[ERROR] ARK trade history request to {ARK_TRADE_HISTORY_URL} failed: {e}")
-        return
-    if resp.status_code != 200:
-        print(f"[ERROR] ARK trade history {ARK_TRADE_HISTORY_URL} returned status {resp.status_code}")
-        return
-
-    # Many implementations expose a direct CSV link via an <a> tag.
-    # Here we extract any .csv URL from the HTML as a simple heuristic.
-    csv_urls = set(re.findall(r"https?://[^\s\"']+\.csv", resp.text))
-    if not csv_urls:
-        return
-
-    session_db = _get_session()
-    try:
-        for url in csv_urls:
-            try:
-                csv_resp = requests.get(url, timeout=30)
-            except requests.exceptions.Timeout:
-                print(f"[TIMEOUT] ARK CSV request to {url} timed out after 30 seconds — skipping")
-                continue
-            except requests.exceptions.RequestException as e:
-                print(f"[ERROR] ARK CSV request to {url} failed: {e}")
-                continue
-
-            if csv_resp.status_code != 200:
-                print(f"[ERROR] ARK CSV {url} returned status {csv_resp.status_code}")
-                continue
-
-            try:
-                text = csv_resp.text
-                reader = csv.DictReader(io.StringIO(text))
-            except Exception as e:
-                print(f"[ERROR] Failed parsing ARK CSV from {url}: {e}")
-                continue
-
-            for row in reader:
-                try:
-                    trade_date = _parse_date(row.get("date") or row.get("Date"))
-                    ticker = (row.get("ticker") or row.get("Ticker") or "").upper()
-                    fund_name = row.get("fund") or row.get("Fund") or "ARK"
-                    company_name = row.get("company") or row.get("Company")
-                    direction = (row.get("direction") or row.get("Direction") or "").lower()
-                    shares = float(row.get("shares") or row.get("Shares") or 0)
-                    notional = float(row.get("value") or row.get("Value") or 0)
-                except Exception:
-                    continue
-
-                large_flag = notional > 10_000_000
-
-                trade = ArkDailyTrade(
-                    trade_date=trade_date or _utc_now().date(),
-                    fund_name=fund_name,
-                    ticker=ticker,
-                    company_name=company_name,
-                    direction=direction,
-                    shares=shares,
-                    notional_value=notional,
-                    large_trade_flag=large_flag,
-                    raw_source_url=url,
-                )
-                session_db.add(trade)
-
-        session_db.commit()
-    finally:
-        session_db.close()
+    # No-op: ARK uses same 13F path as other tracked funds.
+    return
 
 
 def _parse_date(value: Optional[str]) -> Optional[date]:
@@ -599,7 +522,7 @@ def run_tracked_funds_ingestion() -> None:
         finally:
             session2.close()
 
-    # ARK trades can be ingested daily.
+    # ARK is ingested via 13F above; ingest_ark_daily_trades() is no-op (trade-history 403).
     ingest_ark_daily_trades()
 
 

@@ -335,72 +335,110 @@ def _ingest_form4_for_ticker(
     limit: int = 20,
 ) -> int:
     """Fetch submissions, find Form 4, download primary doc, parse, store. Returns count stored."""
-    data = _fetch_submissions(session_http, cik)
-    if not data:
-        return 0
-    filings = data.get("filings", {}).get("recent", {})
-    if not filings:
-        return 0
-    forms = filings.get("form") or []
-    accessions = filings.get("accessionNumber") or []
-    primary_docs = filings.get("primaryDocument") or []
-    filing_dates = filings.get("filingDate") or []
-    count = 0
-    for i, form in enumerate(forms):
-        if form != "4":
-            continue
-        if count >= limit:
-            break
-        acc = accessions[i] if i < len(accessions) else None
-        prim = primary_docs[i] if i < len(primary_docs) else "form4.xml"
-        fd = filing_dates[i] if i < len(filing_dates) else str(date.today())
-        try:
-            filing_date = date.fromisoformat(fd[:10])
-        except Exception:
-            filing_date = date.today()
-        if not acc:
-            continue
-        url = _get_filing_document_url(acc, prim)
-        try:
-            r = session_http.get(url, timeout=30)
-        except requests.exceptions.Timeout:
-            print(f"[TIMEOUT] Form 4 document request to {url} timed out after 30 seconds — skipping")
-            continue
-        except requests.exceptions.RequestException as e:
-            print(f"[ERROR] Form 4 document request to {url} failed: {e}")
-            continue
-        _rate_limit()
-        if r.status_code != 200:
-            print(f"[ERROR] Form 4 document {url} returned status {r.status_code}")
-            continue
-        rows = _parse_form4_xml(r.text, ticker, filing_date, acc)
-        # Phase 10: OCR fallback when primary (XML) parse returns nothing and doc is PDF
-        if not rows and r.content and len(r.content) >= 4 and r.content[:4] == b"%PDF":
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp.write(r.content)
-                tmp_path = Path(tmp.name)
+    try:
+        data = _fetch_submissions(session_http, cik)
+        if not data:
+            return 0
+        filings = data.get("filings", {}).get("recent", {})
+        if not filings:
+            return 0
+        forms = filings.get("form") or []
+        accessions = filings.get("accessionNumber") or []
+        primary_docs = filings.get("primaryDocument") or []
+        filing_dates = filings.get("filingDate") or []
+        count = 0
+        for i, form in enumerate(forms):
+            if form != "4":
+                continue
+            if count >= limit:
+                break
             try:
-                text, source = extract_text_cascade(file_path=tmp_path)
-                if text and source != "manual":
-                    rows = _parse_form4_xml(text, ticker, filing_date, acc)
-            finally:
+                acc = accessions[i] if i < len(accessions) else None
+                prim = primary_docs[i] if i < len(primary_docs) else "form4.xml"
+                fd = filing_dates[i] if i < len(filing_dates) else str(date.today())
                 try:
-                    tmp_path.unlink(missing_ok=True)
+                    filing_date = date.fromisoformat(fd[:10])
                 except Exception:
+                    filing_date = date.today()
+                if not acc:
+                    continue
+                url = _get_filing_document_url(acc, prim)
+                try:
+                    r = session_http.get(url, timeout=30)
+                except requests.exceptions.Timeout:
+                    try:
+                        print(f"[TIMEOUT] Form 4 timed out for {ticker}")
+                    except OSError:
+                        pass
+                    continue
+                except requests.exceptions.RequestException as e:
+                    try:
+                        print(f"[ERROR] Form 4 request failed for {ticker}: {type(e).__name__}")
+                    except OSError:
+                        pass
+                    continue
+                _rate_limit()
+                if r.status_code != 200:
+                    try:
+                        print(f"[ERROR] Form 4 status {r.status_code} for {ticker}")
+                    except OSError:
+                        pass
+                    continue
+                rows = _parse_form4_xml(r.text, ticker, filing_date, acc)
+                if not rows and r.content and len(r.content) >= 4 and r.content[:4] == b"%PDF":
+                    import tempfile
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                            tmp.write(r.content)
+                            tmp_path = Path(tmp.name)
+                        try:
+                            text, source = extract_text_cascade(file_path=tmp_path)
+                            if text and source != "manual":
+                                rows = _parse_form4_xml(text, ticker, filing_date, acc)
+                        finally:
+                            try:
+                                tmp_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                for row in rows:
+                    try:
+                        existing = session_orm.query(InsiderTransaction).filter_by(
+                            ticker=ticker,
+                            filing_date=row["filing_date"],
+                            insider_name=row["insider_name"],
+                            source_filing=row["source_filing"],
+                        ).first()
+                        if not existing:
+                            session_orm.add(InsiderTransaction(**row))
+                            count += 1
+                    except Exception:
+                        continue
+                try:
+                    session_orm.flush()
+                except Exception as e:
+                    try:
+                        print(f"[WARN] Form 4 flush failed for {ticker}: {type(e).__name__}")
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            except Exception as e:
+                try:
+                    print(f"[WARN] Form 4 skipping doc for {ticker}: {type(e).__name__}")
+                except OSError:
                     pass
-        for row in rows:
-            existing = session_orm.query(InsiderTransaction).filter_by(
-                ticker=ticker,
-                filing_date=row["filing_date"],
-                insider_name=row["insider_name"],
-                source_filing=row["source_filing"],
-            ).first()
-            if not existing:
-                session_orm.add(InsiderTransaction(**row))
-                count += 1
-        session_orm.flush()
-    return count
+                continue
+        return count
+    except OSError:
+        return 0
+    except Exception as e:
+        try:
+            print(f"[WARN] Form 4 ingestion failed for {ticker}: {type(e).__name__}")
+        except OSError:
+            pass
+        return 0
 
 
 def _poll_8k_rss(session_orm, session_http: requests.Session, cik: str) -> Optional[datetime]:
@@ -413,33 +451,67 @@ def _poll_8k_rss(session_orm, session_http: requests.Session, cik: str) -> Optio
     try:
         r = session_http.get(url, timeout=30)
     except requests.exceptions.Timeout:
-        print(f"[TIMEOUT] 8-K RSS request to {url} timed out after 30 seconds — skipping")
+        try:
+            print(f"[TIMEOUT] 8-K RSS timed out for CIK {cik}")
+        except OSError:
+            pass
         return None
     except requests.exceptions.RequestException as e:
-        print(f"[ERROR] 8-K RSS request to {url} failed: {e}")
+        try:
+            print(f"[ERROR] 8-K RSS request failed for CIK {cik}: {type(e).__name__}")
+        except OSError:
+            pass
         return None
+
     _rate_limit()
+
     if r.status_code != 200:
-        print(f"[ERROR] 8-K RSS {url} returned status {r.status_code}")
+        try:
+            print(f"[ERROR] 8-K RSS status {r.status_code} for CIK {cik}")
+        except OSError:
+            pass
         return None
-    feed = feedparser.parse(r.content)
+
+    try:
+        feed = feedparser.parse(r.content)
+    except Exception as e:
+        try:
+            print(f"[ERROR] feedparser failed for CIK {cik}: {type(e).__name__}")
+        except OSError:
+            pass
+        return None
+
     updated = None
     for entry in feed.entries[:10]:
         updated_parsed = entry.get("updated_parsed")
         if updated_parsed:
-            from time import mktime
-            utc = datetime.fromtimestamp(mktime(updated_parsed), tz=timezone.utc)
-            if updated is None or utc > updated:
-                updated = utc
+            try:
+                from time import mktime
+                utc = datetime.fromtimestamp(mktime(updated_parsed), tz=timezone.utc)
+                if updated is None or utc > updated:
+                    updated = utc
+            except Exception:
+                continue
+
     if updated is None:
         updated = datetime.now(timezone.utc)
-    row = session_orm.query(EdgarRssLastChecked).filter(EdgarRssLastChecked.cik == cik).first()
-    if row:
-        row.last_checked = updated
-        row.updated_at = datetime.now(timezone.utc)
-    else:
-        session_orm.add(EdgarRssLastChecked(cik=cik, last_checked=updated))
-    session_orm.flush()
+
+    try:
+        row = session_orm.query(EdgarRssLastChecked).filter(
+            EdgarRssLastChecked.cik == cik
+        ).first()
+        if row:
+            row.last_checked = updated
+            row.updated_at = datetime.now(timezone.utc)
+        else:
+            session_orm.add(EdgarRssLastChecked(cik=cik, last_checked=updated))
+        session_orm.flush()
+    except Exception as e:
+        try:
+            print(f"[ERROR] 8-K RSS DB flush failed for CIK {cik}: {type(e).__name__}")
+        except OSError:
+            pass
+
     return updated
 
 
@@ -472,28 +544,65 @@ def run_edgar_ingestion(tickers: Optional[List[str]] = None) -> None:
         for ticker in tickers:
             cik = _get_cik_for_ticker(session_orm, ticker)
             if not cik:
-                print(f"  [WARN] {ticker}: no CIK found")
+                try:
+                    print(f"  [WARN] {ticker}: no CIK found")
+                except OSError:
+                    pass
                 continue
 
             facts_json = _fetch_company_facts(session_http, cik)
             if facts_json:
                 rows = _extract_us_gaap_facts(facts_json, ticker)
                 _upsert_edgar_facts(session_orm, rows)
-                print(f"  [OK] {ticker} edgar_facts: {len(rows)} rows")
+                try:
+                    print(f"  [OK] {ticker} edgar_facts: {len(rows)} rows")
+                except OSError:
+                    pass
             else:
-                print(f"  [WARN] {ticker}: no company facts")
+                try:
+                    print(f"  [WARN] {ticker}: no company facts")
+                except OSError:
+                    pass
 
             n4 = _ingest_form4_for_ticker(session_orm, session_http, ticker, cik, limit=15)
-            print(f"  [OK] {ticker} Form 4: {n4} insider transactions")
+            try:
+                print(f"  [OK] {ticker} Form 4: {n4} insider transactions")
+            except OSError:
+                pass
 
-            _poll_8k_rss(session_orm, session_http, cik)
-            print(f"  [OK] {ticker} 8-K RSS last_checked updated")
+            try:
+                _poll_8k_rss(session_orm, session_http, cik)
+                try:
+                    print(f"  [OK] {ticker} 8-K RSS last_checked updated")
+                except OSError:
+                    pass
+            except OSError:
+                # Ignore console/OS-level errors during 8-K polling
+                pass
+            except Exception as e:
+                try:
+                    print(f"  [WARN] {ticker} 8-K RSS failed: {type(e).__name__}")
+                except OSError:
+                    pass
 
         session_orm.commit()
-        print("[OK] EDGAR ingestion complete")
+        try:
+            print("[OK] EDGAR ingestion complete")
+        except OSError:
+            pass
+    except OSError as e:
+        session_orm.rollback()
+        try:
+            print(f"[ERROR] EDGAR ingestion OSError: {e.errno} - {e.strerror}")
+        except Exception:
+            pass
+        # Do not re-raise OSError — avoid crashing the dashboard on console issues
     except Exception as e:
         session_orm.rollback()
-        print(f"[ERROR] EDGAR ingestion failed: {e}")
+        try:
+            print(f"[ERROR] EDGAR ingestion failed: {type(e).__name__}")
+        except Exception:
+            pass
         raise
     finally:
         session_orm.close()
@@ -504,7 +613,20 @@ def run_edgar_for_all() -> None:
     Convenience wrapper for dashboards/schedulers: run EDGAR ingestion
     for all active, unpaused equity/ADR companies.
     """
-    run_edgar_ingestion(tickers=None)
+    import sys
+    import io
+    # Redirect stdout to prevent OSError [Errno 22] on Windows console
+    # when printing URLs with special characters
+    old_stdout = sys.stdout
+    try:
+        sys.stdout = io.StringIO()
+        run_edgar_ingestion(tickers=None)
+    except OSError:
+        pass
+    except Exception:
+        raise
+    finally:
+        sys.stdout = old_stdout
 
 
 if __name__ == "__main__":
@@ -513,3 +635,4 @@ if __name__ == "__main__":
     print("Market Lens — EDGAR Ingestion")
     print("-----------------------------")
     run_edgar_ingestion(tickers)
+

@@ -166,38 +166,25 @@ Monitors:
 
 ## Development Phases
 
-Status as of 2026-07-10, based on `GO_LIVE_VERIFICATION_SUMMARY.md` and a live
-verification pass (Telegram, Claude Haiku/Sonnet, congressional data sources).
-All active code lives under `market_lens/`; the top-level `ingestion/`,
-`analysis/`, `agent/`, `alerts/`, `recommendation/`, `database/`, and `models/`
-folders are stale pre-consolidation duplicates and are not imported by
-`app.py` or `agent.py`.
-
 - ✅ **Phase 1**: Foundation (config, models, seed, watchlist)
-- ✅ **Phase 2**: Price & fundamentals ingestion
-- ✅ **Phase 3**: EDGAR ingestion
-- ✅ **Phase 4**: Fundamentals analysis & valuation
-- ✅ **Phase 5**: Scoring engine
-- ✅ **Phase 6**: NLP pipeline — implemented with Claude Haiku sentiment scoring instead of FinBERT
-- ✅ **Phase 7**: Streamlit dashboard (9 tabs)
-- ✅ **Phase 8**: Alerts — Telegram verified live; email (AOL SMTP) code path is correct but untestable from a sandbox that blocks outbound port 587
-- ✅ **Phase 9**: Claude API rationale generation — verified live (Haiku + Sonnet)
-- ✅ **Phase 10**: OCR pipeline (EDGAR text → pdfplumber → Tesseract → manual-placeholder cascade)
-- ✅ **Phase 11**: Agent brain core (memory + delta)
-- ✅ **Phase 12**: Agent synthesizer (Claude reasoning) — verified live
-- ✅ **Phase 13**: Court docket monitor
-- ✅ **Phase 14**: Agent scheduling & full loop (APScheduler cron jobs in `agent.py`)
-- ✅ **Phase 15**: Leadership instability tracker
-- ✅ **Phase 16**: Supplier intelligence
-- ✅ **Phase 17**: Agent brain dashboard tab — now a dedicated "Agent Brain" tab
-- ✅ **Phase 18**: Weekly sector scanner
-- ⚠️ **Phase 19**: Congressional trading tracker — ingestion code is complete, but all three of its free data sources are currently dead/paywalled: the House GitHub JSON mirror repo no longer exists (404), the House Clerk fallback target is a JS-rendered SPA that yields no scrapeable links, and the Senate GitHub mirror hasn't been updated since 2021. FMP's `senate-trades` endpoint requires a paid tier not included on the current key. A new data source needs to be sourced before this phase produces live data.
-
-### Known issues fixed since the phases above were last verified
-
-- Tracked-funds quarter-over-quarter position delta computation was a stub (`TODO`); now implemented in `market_lens/ingestion/tracked_funds.py`.
-- `agent.py` scheduled both a standalone Saturday sector-scan job and the weekly-digest job (which itself calls the sector scan) at the same time, doubling scan writes and Claude Haiku calls — the redundant job was removed.
-- `CLAUDE_SONNET_MODEL` defaulted to a retired model ID (`claude-sonnet-4-20250514`, HTTP 404) in `market_lens/config.py` — every Sonnet-tier call (agent synthesis, recommendation rationale) was silently failing. Updated to `claude-sonnet-5`.
+- ⏳ **Phase 2**: Price & fundamentals ingestion
+- ⏳ **Phase 3**: EDGAR ingestion
+- ⏳ **Phase 4**: Fundamentals analysis & valuation
+- ⏳ **Phase 5**: Scoring engine
+- ⏳ **Phase 6**: NLP pipeline (FinBERT)
+- ⏳ **Phase 7**: Streamlit dashboard
+- ⏳ **Phase 8**: Alerts (Telegram + email)
+- ⏳ **Phase 9**: Claude API rationale generation
+- ⏳ **Phase 10**: OCR pipeline
+- ⏳ **Phase 11**: Agent brain core (memory + delta)
+- ⏳ **Phase 12**: Agent synthesizer (Claude reasoning)
+- ⏳ **Phase 13**: Court docket monitor
+- ⏳ **Phase 14**: Agent scheduling & full loop
+- ⏳ **Phase 15**: Leadership instability tracker
+- ⏳ **Phase 16**: Supplier intelligence
+- ⏳ **Phase 17**: Agent brain dashboard tab
+- ⏳ **Phase 18**: Weekly sector scanner
+- ⏳ **Phase 19**: Congressional trading tracker
 
 ## Design Principles
 

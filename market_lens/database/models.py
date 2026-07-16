@@ -9,6 +9,7 @@ from sqlalchemy import (
     Column, String, Integer, Float, Boolean, DateTime, Date, Text, JSON,
     Enum as SQLEnum, ForeignKey, Index, UniqueConstraint
 )
+from sqlalchemy import func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 import enum
@@ -107,6 +108,8 @@ class Company(Base):
     free_cash_flow = Column(Float)
     debt_to_equity = Column(Float)
     beta = Column(Float)
+    short_ratio = Column(Float)           # days to cover (short interest / avg daily volume)
+    short_percent_float = Column(Float)   # short interest as % of float
     industry = Column(String(255))
     long_name = Column(String(500))
     current_price = Column(Float)
@@ -647,22 +650,20 @@ class DisclosureTimingProfile(Base):
 
 
 class LobbyingRegistration(Base):
-    """Lobbying activity from LDA (lda.gov) and House Clerk (Azure Elastic)."""
+    """Lobbying activity from LDA (Lobbying Disclosure Act) API."""
     __tablename__ = "lobbying_registrations"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     registration_id = Column(String(100), unique=True, nullable=False)
-    filing_id = Column(String(100))
     registrant_name = Column(String(255))
     client_name = Column(String(255))
     filing_date = Column(Date, nullable=False)
     covered_officials = Column(JSON)
     sector_keywords = Column(JSON)
+    # Raw lobbying_activities array from LDA API
     lobbying_activities = Column(JSON)
     committee_match = Column(Boolean, default=False)
     flagged = Column(Boolean, default=False)
-    senate_id = Column(String(50))
-    source = Column(String(50))
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -870,3 +871,45 @@ class ArkDailyTrade(Base):
     large_trade_flag = Column(Boolean, default=False)  # > $10M
     raw_source_url = Column(Text)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class EarningsEvent(Base):
+    __tablename__ = "earnings_events"
+
+    id = Column(Integer, primary_key=True)
+    ticker = Column(String, nullable=False, index=True)
+    company_name = Column(String)
+    earnings_date = Column(Date, nullable=False)
+    fiscal_quarter = Column(String)       # e.g. "Q1 2026"
+    fiscal_year = Column(Integer)
+    eps_estimate = Column(Float)          # analyst consensus estimate
+    eps_actual = Column(Float)            # filled after earnings release
+    revenue_estimate = Column(Float)
+    revenue_actual = Column(Float)
+    surprise_pct = Column(Float)          # (actual - estimate) / abs(estimate) * 100
+    beat = Column(Boolean)                # True if beat, False if miss, None if pending
+    confirmed = Column(Boolean, default=False)  # True if date is confirmed not estimated
+    source = Column(String, default="yfinance")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("ticker", "earnings_date", "fiscal_quarter", name="uq_earnings_event"),
+    )
+
+
+class DebtMaturity(Base):
+    __tablename__ = "debt_maturities"
+
+    id = Column(Integer, primary_key=True)
+    ticker = Column(String, nullable=False, index=True)
+    maturity_year = Column(Integer, nullable=False)
+    amount_millions = Column(Float)
+    label = Column(String)
+    source = Column(String)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("ticker", "maturity_year", name="uq_debt_maturity"),
+    )

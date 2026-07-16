@@ -261,6 +261,110 @@ def run_prices_ingestion(tickers: Optional[List[str]] = None) -> None:
         session.close()
 
 
+def run_intraday_quotes(tickers: Optional[List[str]] = None) -> None:
+    """
+    Lightweight intraday price update — runs every 15 min during market hours.
+    Only updates current_price on Company and inserts/updates today's PriceHistory row.
+    Does NOT re-pull 5Y history or quarterly financials.
+    """
+    from datetime import time as dt_time  # noqa: F401  (kept for future market window tweaks)
+    import pytz
+
+    ET = pytz.timezone("America/New_York")
+    now_et = datetime.now(ET)
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+
+    # Only run during market hours
+    if not (market_open <= now_et <= market_close):
+        return
+
+    engine, session = _engine_and_session()
+    try:
+        if tickers is None:
+            companies = session.query(Company).filter_by(active=True, paused=False).all()
+            tickers = [c.ticker for c in companies]
+
+        print(f"[IntradayQuotes] Fetching {len(tickers)} tickers...")
+        updated = 0
+
+        for ticker in tickers:
+            try:
+                t = yf.Ticker(ticker)
+                info = t.info or {}
+
+                price = _safe_float(
+                    info.get("currentPrice")
+                    or info.get("regularMarketPrice")
+                    or info.get("bid")
+                )
+                if not price:
+                    continue
+
+                # Update current_price on Company
+                company = session.query(Company).filter_by(ticker=ticker).first()
+                if company:
+                    company.current_price = price
+
+                # Upsert today's PriceHistory row
+                today = date.today()
+                existing_ph = (
+                    session.query(PriceHistory)
+                    .filter_by(ticker=ticker, date=today)
+                    .first()
+                )
+
+                open_price = _safe_float(
+                    info.get("regularMarketOpen") or info.get("open")
+                )
+                high_price = _safe_float(
+                    info.get("regularMarketDayHigh") or info.get("dayHigh")
+                )
+                low_price = _safe_float(
+                    info.get("regularMarketDayLow") or info.get("dayLow")
+                )
+                volume = info.get("regularMarketVolume") or info.get("volume")
+
+                if existing_ph:
+                    existing_ph.close = price
+                    if high_price:
+                        existing_ph.high = high_price
+                    if low_price:
+                        existing_ph.low = low_price
+                    if volume:
+                        existing_ph.volume = volume
+                else:
+                    session.add(
+                        PriceHistory(
+                            ticker=ticker,
+                            date=today,
+                            open=open_price,
+                            high=high_price,
+                            low=low_price,
+                            close=price,
+                            volume=volume,
+                            adj_close=price,
+                            source="yfinance_intraday",
+                        )
+                    )
+
+                updated += 1
+                session.commit()
+
+            except Exception as e:
+                try:
+                    print(f"[IntradayQuotes] {ticker} failed: {type(e).__name__}")
+                except OSError:
+                    pass
+                session.rollback()
+                continue
+
+        print(f"[IntradayQuotes] Done — {updated} tickers updated")
+
+    finally:
+        session.close()
+
+
 def run_prices_for_all() -> None:
     """
     Convenience wrapper for dashboards/schedulers: run price/fundamentals
