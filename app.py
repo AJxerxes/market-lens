@@ -4,11 +4,17 @@ Run: streamlit run app.py
 """
 import streamlit as st
 from pathlib import Path
+import os
 
-env_path = Path(__file__).parent / ".env"
-if not env_path.exists():
-    st.error(f"CRITICAL: .env file not found at {env_path}. You are running from the wrong directory. Run from: C:\\Users\\User\\.cursor\\worktrees\\Market_Lens\\avi")
-    st.stop()
+# On Streamlit Community Cloud, config comes from st.secrets rather than a local
+# .env file. Bridge it into os.environ so the rest of the codebase (which reads
+# config via os.getenv, e.g. market_lens/config.py) works unchanged in both places.
+try:
+    for _k, _v in st.secrets.items():
+        os.environ.setdefault(_k, str(_v))
+except Exception:
+    pass  # no secrets.toml locally — fine, .env covers it instead
+
 import pandas as pd
 import requests
 from datetime import date, datetime, timezone, timedelta
@@ -304,7 +310,7 @@ if st.sidebar.button("Refresh Congress & Hearings", type="secondary"):
 st.sidebar.caption(f"Last congress refresh: {st.session_state.get('last_congress_refresh', 'Not yet this session')}")
 
 if st.sidebar.button("Run Briefing Now", key="sidebar_run_briefing"):
-    with st.sidebar.spinner("Running daily briefing..."):
+    with st.spinner("Running daily briefing..."):
         try:
             from market_lens.ingestion.sector_scanner import run_daily_digest
             run_daily_digest(slot="evening")
