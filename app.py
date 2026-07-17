@@ -648,6 +648,20 @@ with tab2:
             )
         st.dataframe(df, width="stretch")
 
+        col_rm_sel, col_rm_btn = st.columns([3, 1], vertical_alignment="bottom")
+        with col_rm_sel:
+            rm_ticker = st.selectbox(
+                "Remove from watchlist", df["ticker"].tolist(), key="tab2_remove_select"
+            )
+        with col_rm_btn:
+            if st.button("Remove", key="tab2_remove_btn") and rm_ticker:
+                result = WatchlistManager().remove_ticker(rm_ticker)
+                if result.get("status") == "not_found":
+                    st.error(result.get("message"))
+                else:
+                    st.success(result.get("message"))
+                    st.rerun()
+
 
 # ----- Tab 3: Deep Dive -----
 with tab3:
