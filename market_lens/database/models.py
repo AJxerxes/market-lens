@@ -16,6 +16,38 @@ import enum
 
 Base = declarative_base()
 
+
+def ensure_columns(engine, table: str, cols) -> None:
+    """Add missing columns to a table (idempotent runtime migration).
+
+    Checks information_schema first so no ALTER TABLE (and no ACCESS EXCLUSIVE
+    lock) is attempted when the columns already exist — a blind ALTER queues
+    behind any open transaction touching the table and wedges every other
+    query behind it.
+    """
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        existing = {
+            r[0]
+            for r in conn.execute(
+                text("SELECT column_name FROM information_schema.columns WHERE table_name = :t"),
+                {"t": table},
+            )
+        }
+        missing = [(n, ct) for n, ct in cols if n not in existing]
+        if not missing:
+            return
+        # First-run only: bound the lock wait so a stuck session can't hang the app
+        conn.execute(text("SET lock_timeout = '5s'"))
+        for col_name, col_type in missing:
+            try:
+                conn.execute(text(f'ALTER TABLE {table} ADD COLUMN "{col_name}" {col_type}'))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+
 # -----------------------------------------------------------------------------
 # Enums
 # -----------------------------------------------------------------------------

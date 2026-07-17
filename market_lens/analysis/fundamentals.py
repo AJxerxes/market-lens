@@ -19,28 +19,15 @@ def _engine_session():
 
 
 def _ensure_company_metrics_columns(engine) -> None:
-    from sqlalchemy import text
-    cols = [
+    from market_lens.database.models import ensure_columns
+    ensure_columns(engine, "companies", [
         ("revenue_cagr_3y", "DOUBLE PRECISION"),
         ("gross_margin_trend", "VARCHAR(20)"),
         ("fcf_yield", "DOUBLE PRECISION"),
         ("debt_ebitda_ratio", "DOUBLE PRECISION"),
         ("dividend_streak_years", "INTEGER"),
-    ]
-    with engine.connect() as conn:
-        for col_name, col_type in cols:
-            try:
-                conn.execute(text(f'ALTER TABLE companies ADD COLUMN "{col_name}" {col_type}'))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-    # Score table: dcf_fair_value_mid
-    with engine.connect() as conn:
-        try:
-            conn.execute(text('ALTER TABLE scores ADD COLUMN "dcf_fair_value_mid" DOUBLE PRECISION'))
-            conn.commit()
-        except Exception:
-            conn.rollback()
+    ])
+    ensure_columns(engine, "scores", [("dcf_fair_value_mid", "DOUBLE PRECISION")])
 
 
 def compute_revenue_cagr(session, ticker: str, years: int = 3) -> Optional[float]:

@@ -123,27 +123,30 @@ class WatchlistManager:
                     "needs_confirmation": len(matches) > 1,
                 }
 
-        # --- Step 2: Fallback — yfinance direct lookup (no FMP or FMP returned nothing) ---
+        # --- Step 2: Fallback — yfinance Search (handles both tickers and company/fund
+        # names; FMP's legacy /search endpoint is deprecated as of Aug 2025, so this is
+        # effectively the primary path). Require a real name back, not just an echoed
+        # symbol, so garbage input can't spuriously "resolve".
         try:
-            upper_query = query.upper()
-            ticker_obj = yf.Ticker(upper_query)
-            info = ticker_obj.info or {}
-            if info and info.get("symbol"):
-                matches.append({
-                    "ticker": info.get("symbol", upper_query).upper(),
-                    "name": info.get("longName") or info.get("shortName") or "Unknown",
-                    "sector": info.get("sector") or "Unknown",
-                    "exchange": info.get("exchange") or "Unknown",
-                    "quote_type": info.get("quoteType", "EQUITY"),
-                })
+            for item in (yf.Search(query, max_results=5).quotes or []):
+                sym = (item.get("symbol") or "").upper()
+                name = item.get("longname") or item.get("shortname")
+                if sym and name:
+                    matches.append({
+                        "ticker": sym,
+                        "name": name,
+                        "sector": item.get("sector") or "Unknown",
+                        "exchange": item.get("exchDisp") or item.get("exchange") or "Unknown",
+                        "quote_type": item.get("quoteType", "EQUITY"),
+                    })
         except Exception as e:
-            print(f"yfinance fallback failed for '{query}': {e}")
+            print(f"yfinance search failed for '{query}': {e}")
 
         if matches:
             return {
                 "matches": matches,
                 "resolved_ticker": matches[0]["ticker"],
-                "needs_confirmation": False,
+                "needs_confirmation": True,
             }
 
         # No matches from FMP or yfinance

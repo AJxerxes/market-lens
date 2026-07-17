@@ -207,10 +207,13 @@ def _upsert_edgar_facts(session_orm, rows: List[Dict]) -> None:
     session_orm.flush()
 
 
-def _get_filing_document_url(accession: str, primary_doc: str) -> str:
+def _get_filing_document_url(cik: str, accession: str, primary_doc: str) -> str:
     """Build URL for primary document. accession is like 0001234567-21-000123."""
     acc = accession.replace("-", "")
-    return f"https://www.sec.gov/Archives/edgar/data/{acc}/{primary_doc}"
+    # primaryDocument for Form 4 is often "xslF345X0x/form4.xml" (rendered HTML);
+    # strip the XSL prefix to fetch the raw XML.
+    doc = primary_doc.split("/")[-1]
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{doc}"
 
 
 def _local_tag(el: ET.Element) -> str:
@@ -261,69 +264,56 @@ def _parse_form4_xml(xml_text: str, ticker: str, filing_date: date, accession: s
     owners = _find_all_local(root, "reportingOwner")
     if not owners:
         owners = [root]
-    for owner in owners:
-        name_el = _find_child_local(owner, "rptOwnerName")
-        name = (name_el.text or "").strip() if name_el is not None and name_el.text else "Unknown"
-        if not name and name_el is not None:
-            for c in name_el:
-                if c.text:
-                    name = c.text.strip()
-                    break
-        if name == "Unknown":
-            for c in owner.iter():
-                if _local_tag(c) == "rptOwnerName" and c.text:
-                    name = c.text.strip()
-                    break
-        for nd in _find_all_local(root, "nonDerivativeTransaction"):
-            shares_el = _find_child_local(nd, "transactionShares")
-            if shares_el is None:
-                for el in nd.iter():
-                    if _local_tag(el) == "transactionShares":
-                        shares_el = el
-                        break
-            shares = None
-            if shares_el is not None and shares_el.text:
+    # Transactions are filing-level, not per-owner; use the first owner's name
+    # so multi-owner filings don't duplicate rows.
+    owner = owners[0]
+    name = "Unknown"
+    for c in owner.iter():
+        if _local_tag(c) == "rptOwnerName" and c.text and c.text.strip():
+            name = c.text.strip()
+            break
+    for nd in _find_all_local(root, "nonDerivativeTransaction"):
+        shares_el = _find_child_local(nd, "transactionShares")
+        shares = None
+        if shares_el is not None:
+            # value lives in a <value> child; wrapper text is whitespace
+            v = _find_child_local(shares_el, "value")
+            txt = v.text if (v is not None and v.text) else shares_el.text
+            if txt:
                 try:
-                    shares = int(float(shares_el.text))
+                    shares = int(float(txt.strip()))
                 except (ValueError, TypeError):
                     pass
-            if shares is None:
-                val = _find_descendant_value(nd, "transactionAmounts", "transactionShares")
-                if val:
-                    try:
-                        shares = int(float(val))
-                    except (ValueError, TypeError):
-                        pass
-            if shares is None:
-                continue
-            price_el = _find_child_local(nd, "transactionPricePerShare")
-            price = None
-            if price_el is not None:
-                v = _find_child_local(price_el, "value")
-                if v is not None and v.text:
-                    try:
-                        price = float(v.text)
-                    except (ValueError, TypeError):
-                        pass
-            acq_el = _find_child_local(nd, "transactionAcquiredDisposedCode")
-            acq = ""
-            if acq_el is not None:
-                v = _find_child_local(acq_el, "value")
-                if v is not None and v.text:
-                    acq = (v.text or "").strip()
-            total = shares * price if price is not None else None
-            trans_type = "buy" if acq.upper() == "A" else "sell"
-            results.append({
-                "ticker": ticker,
-                "filing_date": filing_date,
-                "insider_name": name,
-                "insider_title": None,
-                "transaction_type": trans_type,
-                "shares": shares,
-                "price_per_share": price,
-                "total_value": total,
-                "source_filing": accession,
-            })
+        if shares is None:
+            continue
+        price_el = _find_child_local(nd, "transactionPricePerShare")
+        price = None
+        if price_el is not None:
+            v = _find_child_local(price_el, "value")
+            if v is not None and v.text:
+                try:
+                    price = float(v.text)
+                except (ValueError, TypeError):
+                    pass
+        acq_el = _find_child_local(nd, "transactionAcquiredDisposedCode")
+        acq = ""
+        if acq_el is not None:
+            v = _find_child_local(acq_el, "value")
+            if v is not None and v.text:
+                acq = (v.text or "").strip()
+        total = shares * price if price is not None else None
+        trans_type = "buy" if acq.upper() == "A" else "sell"
+        results.append({
+            "ticker": ticker,
+            "filing_date": filing_date,
+            "insider_name": name,
+            "insider_title": None,
+            "transaction_type": trans_type,
+            "shares": shares,
+            "price_per_share": price,
+            "total_value": total,
+            "source_filing": accession,
+        })
     return results
 
 
@@ -362,7 +352,7 @@ def _ingest_form4_for_ticker(
                     filing_date = date.today()
                 if not acc:
                     continue
-                url = _get_filing_document_url(acc, prim)
+                url = _get_filing_document_url(cik, acc, prim)
                 try:
                     r = session_http.get(url, timeout=30)
                 except requests.exceptions.Timeout:

@@ -22,7 +22,7 @@ with engine.connect() as conn:
         ORDER BY ticker
     """), conn)
 st.subheader("Companies (current price, market cap, data quality)")
-st.dataframe(df, use_container_width=True)
+st.dataframe(df, width="stretch")
 
 ticker = st.selectbox("Select ticker for price chart", df["ticker"].tolist())
 if ticker:
@@ -35,6 +35,6 @@ if ticker:
         """), conn, params={"t": ticker})
     if not hist.empty:
         fig = px.line(hist, x="date", y="close", title=f"{ticker} — Close Price")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("No price history for this ticker.")

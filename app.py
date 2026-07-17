@@ -139,16 +139,16 @@ html, body, [class*="css"] {
 }
 
 /* Title */
-h1 { 
-    font-size: 1.6rem !important; 
+h1 {
+    font-size: 1.6rem !important;
     font-weight: 600 !important;
-    color: #1a1a1a !important;
+    color: #c8842a !important;
     letter-spacing: -0.02em;
 }
 
-h2, h3 { 
+h2, h3, h4 {
     font-weight: 500 !important;
-    color: #1a1a1a !important;
+    color: #c8842a !important;
 }
 
 /* Insight cards */
@@ -363,7 +363,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 
 
 def _render_quick_add(prefix: str) -> None:
-    """Shared quick-add widget to resolve and add any supported instrument to the watchlist."""
+    """Shared quick-add widget: search first, confirm the real company, then add."""
     st.caption(
         "Quick add to watchlist (equities, ETFs, mutual funds; background backfill runs after add)."
     )
@@ -372,46 +372,59 @@ def _render_quick_add(prefix: str) -> None:
         key=f"{prefix}_add_input",
         placeholder="e.g. AAPL, SPY, or 'Vanguard Total World'",
     )
-    thesis = st.text_input(
-        "Optional thesis / notes",
-        key=f"{prefix}_add_thesis",
-        placeholder="Why this belongs on your Lynch list (optional)",
-    )
-    if st.button("Add to watchlist", key=f"{prefix}_add_btn"):
+
+    result_key = f"{prefix}_search_result"
+    searched_query_key = f"{prefix}_searched_query"
+
+    # A new/changed query invalidates any previous search result.
+    if st.session_state.get(searched_query_key) != q:
+        st.session_state.pop(result_key, None)
+
+    if st.button("Search", key=f"{prefix}_search_btn"):
         if not q or not q.strip():
             st.warning("Enter a ticker or name.")
-            return
-        with st.spinner("Resolving instrument and adding to watchlist..."):
-            try:
-                wl = WatchlistManager()
-                search_result = wl.search_ticker(q.strip())
-                if search_result.get("error"):
-                    st.error(search_result["error"])
-                    return
-                resolved = search_result.get("resolved_ticker")
-                matches = search_result.get("matches") or []
-                if not resolved:
-                    st.error(
-                        "No match found across FMP/yfinance. Check symbol spelling or try a different name."
-                    )
-                    return
-                if matches:
-                    first = matches[0]
-                    st.caption(
-                        f"Resolved: {first.get('ticker')} "" {first.get('name')} "
-                        f"({first.get('exchange')}, {first.get('sector')})"
-                    )
-                add_result = wl.add_ticker(
-                    resolved,
-                    thesis_notes=thesis.strip() or None,
-                    force=True,
-                )
-                if add_result.get("status") == "error":
-                    st.error(add_result.get("error", "Add to watchlist failed."))
-                else:
-                    st.success(add_result.get("message", f"{resolved} on watchlist."))
-            except Exception as e:
-                st.error(f"Add to watchlist failed: {e}")
+        else:
+            with st.spinner("Searching..."):
+                st.session_state[result_key] = WatchlistManager().search_ticker(q.strip())
+                st.session_state[searched_query_key] = q
+
+    search_result = st.session_state.get(result_key)
+    if search_result:
+        if search_result.get("error"):
+            st.error(search_result["error"])
+        else:
+            matches = search_result.get("matches") or []
+            options = {
+                f"{m['ticker']} — {m['name']} ({m.get('exchange') or 'Unknown'})": m
+                for m in matches
+            }
+            choice = st.radio(
+                "Confirm this is the company/fund you meant:",
+                list(options.keys()),
+                key=f"{prefix}_confirm_choice",
+            )
+            thesis = st.text_input(
+                "Optional thesis / notes",
+                key=f"{prefix}_add_thesis",
+                placeholder="Why this belongs on your Lynch list (optional)",
+            )
+            if st.button("Confirm & Add to Watchlist", key=f"{prefix}_add_btn", type="primary"):
+                selected = options[choice]
+                with st.spinner(f"Adding {selected['ticker']}..."):
+                    try:
+                        add_result = WatchlistManager().add_ticker(
+                            selected["ticker"],
+                            thesis_notes=thesis.strip() or None,
+                            force=True,
+                        )
+                        if add_result.get("status") == "error":
+                            st.error(add_result.get("error", "Add to watchlist failed."))
+                        else:
+                            st.success(add_result.get("message", f"{selected['ticker']} on watchlist."))
+                            st.session_state.pop(result_key, None)
+                            st.session_state.pop(searched_query_key, None)
+                    except Exception as e:
+                        st.error(f"Add to watchlist failed: {e}")
 
 
 with tab1:
@@ -633,7 +646,7 @@ with tab2:
             df["days_to_cover"] = df["days_to_cover"].apply(
                 lambda x: f"{x:.1f}d" if pd.notna(x) and x else "—"
             )
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
 
 
 # ----- Tab 3: Deep Dive -----
@@ -687,7 +700,7 @@ with tab3:
                 fig.add_trace(go.Scatter(x=hist["date"], y=hist["ma50"], name="50 MA", line=dict(color="orange", dash="dash")))
                 fig.add_trace(go.Scatter(x=hist["date"], y=hist["ma200"], name="200 MA", line=dict(color="gray", dash="dot")))
                 fig.update_layout(title=f"{selected} - Price", xaxis_title="Date", yaxis_title="Price", height=400)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             with engine.connect() as conn:
                 score = pd.read_sql(text("SELECT * FROM scores WHERE ticker = :t ORDER BY score_date DESC LIMIT 1"), conn, params={"t": selected})
             if not score.empty:
@@ -874,7 +887,7 @@ with tab6:
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=dates, y=values, mode="lines+markers", name=label))
                 fig.update_layout(title=label, xaxis_title="Date", height=220, margin=dict(t=40, b=40))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.warning(f"{label} ({sid}): No data returned. Check series ID or API rate limits.")
         if macro_snapshot:
@@ -943,7 +956,7 @@ with tab6:
     session_sb = _session()
     try:
         now_utc = datetime.now(timezone.utc)
-        cutoff_7d = now_utc - timedelta(days=7)
+        cutoff_recent = now_utc - timedelta(days=30)
         posts = (
             session_sb.query(SubstackPost, SubstackFeed)
             .join(SubstackFeed, SubstackPost.feed_id == SubstackFeed.id)
@@ -956,17 +969,28 @@ with tab6:
             for (p, f) in posts
             if p.watchlist_crossref_flag
             and p.published_date is not None
-            and p.published_date >= cutoff_7d
+            and p.published_date >= cutoff_recent
         ]
         if cross_posts:
-            st.markdown("**Watchlist crossovers (last 7 days)**")
+            st.markdown("**Watchlist crossovers (last 30 days)**")
+            watchlist_set = {
+                c.ticker
+                for c in session_sb.query(Company).filter(Company.active == True).all()
+            }
             for post, feed in cross_posts:
-                tickers_str = ", ".join(post.extracted_tickers or []) or "unknown"
+                extracted = post.extracted_tickers or []
+                matched = [t for t in extracted if t in watchlist_set] or extracted
+                if matched:
+                    what = f"mentioned **{', '.join(matched)}**"
+                else:
+                    # Sector-based crossover: flag set by watchlist-relevant sectors, no tickers extracted
+                    sectors = ", ".join((post.extracted_sectors or [])[:3])
+                    what = f"covered **{sectors or 'watchlist-relevant themes'}**"
                 st.markdown(
-                    f"- {feed.author_name} mentioned watchlist ticker **{tickers_str}** — {post.claude_one_sentence_thesis or post.title}"
+                    f"- {feed.author_name} {what} — {post.claude_one_sentence_thesis or post.title}"
                 )
         else:
-            st.caption("No Substack posts mentioning your watchlist in the last 7 days.")
+            st.caption("No Substack posts mentioning your watchlist in the last 30 days.")
 
         st.markdown("**Recent Substack posts**")
         if posts:
@@ -1067,15 +1091,27 @@ with tab6:
 # ----- Tab 5: Congress & Funds -----
 with tab6:
     st.subheader("Weekly Sector Digest")
-    if st.button("Run Briefing Now", key="tab5_run_briefing", type="primary"):
-        with st.spinner("Running daily briefing..."):
-            try:
-                from market_lens.ingestion.sector_scanner import run_daily_digest
-                run_daily_digest(slot="evening")
-                st.success("Briefing generated.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Briefing error: {e}")
+    col_daily, col_weekly = st.columns(2)
+    with col_daily:
+        if st.button("Run Briefing Now", key="tab5_run_briefing", type="primary"):
+            with st.spinner("Running daily briefing..."):
+                try:
+                    from market_lens.ingestion.sector_scanner import run_daily_digest
+                    run_daily_digest(slot="evening")
+                    st.success("Briefing generated.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Briefing error: {e}")
+    with col_weekly:
+        if st.button("Generate Weekly Digest Now", key="tab5_run_weekly"):
+            with st.spinner("Generating weekly digest (normally runs Saturday 8 PM)..."):
+                try:
+                    from market_lens.ingestion.sector_scanner import run_weekly_digest
+                    run_weekly_digest()
+                    st.success("Weekly digest generated.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Weekly digest error: {e}")
 
     session = _session()
     try:
@@ -1089,7 +1125,7 @@ with tab6:
         )
         if latest_daily and latest_daily.full_digest_text:
             st.markdown("#### Latest daily briefing")
-            st.caption(f"{latest_daily.digest_date} ({latest_daily.digest_time or '""'})")
+            st.caption(f"{latest_daily.digest_date} ({latest_daily.digest_time or ''})")
             st.write(latest_daily.full_digest_text)
 
         # Most recent weekly digest
@@ -1144,7 +1180,7 @@ with tab6:
                 }
                 for s in scans
             ])
-            st.dataframe(df_sector, use_container_width=True)
+            st.dataframe(df_sector, width="stretch")
         else:
             st.info("Sector scan runs every Saturday at 8pm ET. No results yet.")
 
@@ -1263,7 +1299,7 @@ with tab5:
     cluster_trades = activity.get("cluster_trades") or []
     if cluster_trades:
         df_clusters = pd.DataFrame(cluster_trades)
-        st.dataframe(df_clusters, use_container_width=True)
+        st.dataframe(df_clusters, width="stretch")
     else:
         st.info("No cluster trades (2+ trades from different members in 60 days).")
 
@@ -1272,7 +1308,7 @@ with tab5:
     upcoming = hearings_tl.get("upcoming_hearings") or []
     if upcoming:
         df_upcoming = pd.DataFrame(upcoming)
-        st.dataframe(df_upcoming, use_container_width=True)
+        st.dataframe(df_upcoming, width="stretch")
     else:
         if not config.CONGRESS_API_KEY:
             st.error(
@@ -1286,7 +1322,7 @@ with tab5:
     recent = hearings_tl.get("recent_hearings") or []
     if recent:
         df_recent = pd.DataFrame(recent)
-        st.dataframe(df_recent, use_container_width=True)
+        st.dataframe(df_recent, width="stretch")
     else:
         st.info("No recorded hearings in the last 30 days.")
 
@@ -1321,9 +1357,38 @@ with tab5:
                         for t in trades
                     ]
                 )
-                st.dataframe(df_congress, use_container_width=True)
+                st.dataframe(df_congress, width="stretch")
             else:
                 st.caption("No trades in the last 60 days.")
+
+        with st.expander("Senate PTR filings (last 90 days)"):
+            cutoff_sen = (datetime.now(timezone.utc) - timedelta(days=90)).date()
+            senate_rows = (
+                session.query(CongressTrade)
+                .filter(CongressTrade.source == "senate_efdsearch")
+                .filter(CongressTrade.disclosure_date >= cutoff_sen)
+                .order_by(CongressTrade.disclosure_date.desc())
+                .all()
+            )
+            if senate_rows:
+                df_senate = pd.DataFrame(
+                    [
+                        {
+                            "member_id": t.member_id,
+                            "disclosure_date": t.disclosure_date.isoformat()
+                            if t.disclosure_date
+                            else "",
+                            "filing": t.company_name,
+                        }
+                        for t in senate_rows
+                    ]
+                )
+                st.dataframe(df_senate, width="stretch")
+            else:
+                st.caption(
+                    "No Senate PTR filings ingested in the last 90 days. "
+                    "Run House + Senate ingestion above (Senate scraping requires Playwright)."
+                )
 
         with st.expander("Raw lobbying filings (last 60 days)"):
             from datetime import date as _date
@@ -1347,7 +1412,7 @@ with tab5:
                         for r in lobby_rows
                     ]
                 )
-                st.dataframe(df_lobby, use_container_width=True)
+                st.dataframe(df_lobby, width="stretch")
             else:
                 st.caption(
                     "No lobbying registrations recorded in the last 60 days. "
@@ -1367,7 +1432,7 @@ with tab5:
                         for c in committees
                     ]
                 )
-                st.dataframe(df_com, use_container_width=True)
+                st.dataframe(df_com, width="stretch")
             else:
                 st.caption("No committee map. Run congress_tracker.seed_committee_sector_map() to populate.")
     finally:
@@ -1422,7 +1487,7 @@ with tab5:
                         }
                         for p in positions
                     ])
-                    st.dataframe(df_fp, use_container_width=True)
+                    st.dataframe(df_fp, width="stretch")
                 else:
                     st.caption("No 13F positions. FMP 13F ingestion may not be configured or returned no data for these funds.")
             with st.expander("Position deltas (quarter-over-quarter)"):
@@ -1432,7 +1497,7 @@ with tab5:
                         {"fund_id": d.fund_id, "ticker": d.ticker, "quarter": d.quarter, "change_type": d.change_type}
                         for d in deltas
                     ])
-                    st.dataframe(df_d, use_container_width=True)
+                    st.dataframe(df_d, width="stretch")
                 else:
                     st.caption("No position deltas. Run tracked funds ingestion to populate.")
             with st.expander("ARK Invest "" Current 13F Holdings"):
@@ -1461,7 +1526,7 @@ with tab5:
                                 for p in ark_positions
                             ]
                         )
-                        st.dataframe(df_ark, use_container_width=True)
+                        st.dataframe(df_ark, width="stretch")
                     else:
                         st.info("ARK 13F positions not yet loaded. Run tracked funds ingestion.")
                 else:
@@ -1611,7 +1676,7 @@ with tab7:
                 }
                 for e in events
             ])
-            st.dataframe(df_le, use_container_width=True)
+            st.dataframe(df_le, width="stretch")
             st.caption("Departure badges: planned / abrupt / forced from 8-K Item 5.02 language.")
     finally:
         session.close()

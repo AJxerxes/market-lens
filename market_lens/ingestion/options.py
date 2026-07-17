@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Iterable, List, Optional, Set
 
+import pandas as pd
 import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
@@ -71,8 +72,9 @@ def fetch_yfinance_option_signals(ticker: str, as_of: Optional[date] = None) -> 
             chain = yf_ticker.option_chain(exp)
             for side_df in (chain.calls, chain.puts):
                 for _, row in side_df.iterrows():
-                    volume = int(row.get("volume") or 0)
-                    oi = int(row.get("openInterest") or 0)
+                    # yfinance returns NaN for missing volume/OI; NaN is truthy so `or 0` won't catch it
+                    volume = int(v) if pd.notna(v := row.get("volume")) else 0
+                    oi = int(v) if pd.notna(v := row.get("openInterest")) else 0
                     if oi <= 0:
                         continue
 
@@ -340,13 +342,22 @@ def run_options_ingestion_for_watchlist(watchlist_tickers: Iterable[str]) -> Non
     """
     today = _utc_today()
 
-    # Layer 1: per-ticker yfinance chains
+    # One flaky source must not kill the whole run
     for ticker in watchlist_tickers:
-        fetch_yfinance_option_signals(ticker, as_of=today)
+        try:
+            fetch_yfinance_option_signals(ticker, as_of=today)
+        except Exception as e:
+            print(f"  [WARN] options yfinance {ticker}: {e}")
 
     # Layer 2 & 3 are global pages filtered by watchlist
-    fetch_unusual_whales_signals(watchlist_tickers, as_of=today)
-    fetch_nasdaq_option_signals(watchlist_tickers, as_of=today)
+    try:
+        fetch_unusual_whales_signals(watchlist_tickers, as_of=today)
+    except Exception as e:
+        print(f"  [WARN] options unusual whales: {e}")
+    try:
+        fetch_nasdaq_option_signals(watchlist_tickers, as_of=today)
+    except Exception as e:
+        print(f"  [WARN] options nasdaq: {e}")
 
     # Cross-validation
     mark_cross_validated_signals(for_date=today)

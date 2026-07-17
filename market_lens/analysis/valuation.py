@@ -230,20 +230,14 @@ def run_valuation_for_ticker(session, ticker: str) -> Optional[Score]:
 
 
 def _ensure_score_mid_column(engine) -> None:
-    from sqlalchemy import text
-    with engine.connect() as conn:
-        try:
-            conn.execute(text('ALTER TABLE scores ADD COLUMN "dcf_fair_value_mid" DOUBLE PRECISION'))
-            conn.commit()
-        except Exception:
-            conn.rollback()
+    from market_lens.database.models import ensure_columns
+    ensure_columns(engine, "scores", [("dcf_fair_value_mid", "DOUBLE PRECISION")])
 
 
 def run_valuation(tickers: Optional[List[str]] = None) -> None:
     """Run valuation for watchlist (or given tickers)."""
-    engine, Session = _engine_session()
+    engine, session = _engine_session()
     _ensure_score_mid_column(engine)
-    session = Session()
     try:
         if tickers is None:
             companies = session.query(Company).filter(Company.active == True).all()

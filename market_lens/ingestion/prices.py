@@ -30,8 +30,8 @@ def _engine_and_session():
 
 def _ensure_company_columns(engine) -> None:
     """Add Phase 2 columns to companies if missing (idempotent)."""
-    from sqlalchemy import text
-    cols = [
+    from market_lens.database.models import ensure_columns
+    ensure_columns(engine, "companies", [
         ("data_quality_flag", "VARCHAR(20)"),
         ("market_cap", "DOUBLE PRECISION"),
         ("trailing_pe", "DOUBLE PRECISION"),
@@ -46,15 +46,7 @@ def _ensure_company_columns(engine) -> None:
         ("industry", "VARCHAR(255)"),
         ("long_name", "VARCHAR(500)"),
         ("current_price", "DOUBLE PRECISION"),
-    ]
-    with engine.connect() as conn:
-        for col_name, col_type in cols:
-            try:
-                conn.execute(text(f'ALTER TABLE companies ADD COLUMN "{col_name}" {col_type}'))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                pass
+    ])
 
 
 def _safe_float(val) -> Optional[float]:
