@@ -532,50 +532,67 @@ def run_edgar_ingestion(tickers: Optional[List[str]] = None) -> None:
             tickers = list(tickers)
 
         for ticker in tickers:
-            cik = _get_cik_for_ticker(session_orm, ticker)
-            if not cik:
+            try:
+                cik = _get_cik_for_ticker(session_orm, ticker)
+                if not cik:
+                    try:
+                        print(f"  [WARN] {ticker}: no CIK found")
+                    except OSError:
+                        pass
+                    continue
+
+                facts_json = _fetch_company_facts(session_http, cik)
+                if facts_json:
+                    rows = _extract_us_gaap_facts(facts_json, ticker)
+                    _upsert_edgar_facts(session_orm, rows)
+                    try:
+                        print(f"  [OK] {ticker} edgar_facts: {len(rows)} rows")
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        print(f"  [WARN] {ticker}: no company facts")
+                    except OSError:
+                        pass
+
+                n4 = _ingest_form4_for_ticker(session_orm, session_http, ticker, cik, limit=15)
                 try:
-                    print(f"  [WARN] {ticker}: no CIK found")
+                    print(f"  [OK] {ticker} Form 4: {n4} insider transactions")
+                except OSError:
+                    pass
+
+                try:
+                    _poll_8k_rss(session_orm, session_http, cik)
+                    try:
+                        print(f"  [OK] {ticker} 8-K RSS last_checked updated")
+                    except OSError:
+                        pass
+                except OSError:
+                    # Ignore console/OS-level errors during 8-K polling
+                    pass
+                except Exception as e:
+                    try:
+                        print(f"  [WARN] {ticker} 8-K RSS failed: {type(e).__name__}")
+                    except OSError:
+                        pass
+
+                # Commit per ticker: each ticker's Form 4 loop makes many
+                # rate-limited network calls, so a single end-of-run commit
+                # holds row locks on already-inserted facts for the entire
+                # multi-ticker run — any concurrent ingestion touching the
+                # same ticker (another browser tab, the 2h scheduler) queues
+                # up behind it for minutes. Per-ticker commit bounds that to
+                # one ticker's worth of work, and a mid-run failure no longer
+                # rolls back tickers already processed.
+                session_orm.commit()
+            except Exception as e:
+                session_orm.rollback()
+                try:
+                    print(f"  [WARN] {ticker}: EDGAR ingestion failed: {type(e).__name__}")
                 except OSError:
                     pass
                 continue
 
-            facts_json = _fetch_company_facts(session_http, cik)
-            if facts_json:
-                rows = _extract_us_gaap_facts(facts_json, ticker)
-                _upsert_edgar_facts(session_orm, rows)
-                try:
-                    print(f"  [OK] {ticker} edgar_facts: {len(rows)} rows")
-                except OSError:
-                    pass
-            else:
-                try:
-                    print(f"  [WARN] {ticker}: no company facts")
-                except OSError:
-                    pass
-
-            n4 = _ingest_form4_for_ticker(session_orm, session_http, ticker, cik, limit=15)
-            try:
-                print(f"  [OK] {ticker} Form 4: {n4} insider transactions")
-            except OSError:
-                pass
-
-            try:
-                _poll_8k_rss(session_orm, session_http, cik)
-                try:
-                    print(f"  [OK] {ticker} 8-K RSS last_checked updated")
-                except OSError:
-                    pass
-            except OSError:
-                # Ignore console/OS-level errors during 8-K polling
-                pass
-            except Exception as e:
-                try:
-                    print(f"  [WARN] {ticker} 8-K RSS failed: {type(e).__name__}")
-                except OSError:
-                    pass
-
-        session_orm.commit()
         try:
             print("[OK] EDGAR ingestion complete")
         except OSError:
