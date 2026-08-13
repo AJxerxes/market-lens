@@ -1148,10 +1148,15 @@ with tab6:
             st.caption(f"{latest_daily.digest_date} ({latest_daily.digest_time or ''})")
             st.write(latest_daily.full_digest_text)
 
-        # Most recent weekly digest
+        # Most recent weekly digest. Every app startup's sector scan silently
+        # inserts a placeholder row for today (see _create_weekly_digest_stub
+        # in sector_scanner.py) — exclude it so a real digest from last
+        # Saturday doesn't get buried under today's unclicked placeholder.
+        WEEKLY_DIGEST_PLACEHOLDER = "Weekly sector digest placeholder. To be generated via Claude Haiku."
         latest_weekly = (
             session.query(WeeklyDigest)
             .filter(WeeklyDigest.digest_type == "weekly")
+            .filter(WeeklyDigest.full_digest_text != WEEKLY_DIGEST_PLACEHOLDER)
             .order_by(WeeklyDigest.digest_date.desc())
             .limit(1)
             .first()
@@ -1160,6 +1165,13 @@ with tab6:
             st.markdown("#### Latest weekly digest")
             st.caption(f"{latest_weekly.digest_date}")
             st.write(latest_weekly.full_digest_text)
+        else:
+            st.markdown("#### Latest weekly digest")
+            st.caption("No real weekly digest generated yet.")
+            st.write(
+                "Real generation runs Saturday 8 PM via the scheduler, or click "
+                "'Generate Weekly Digest Now' above to generate one on demand."
+            )
 
         # Date picker for historical digests
         from datetime import date as _date
