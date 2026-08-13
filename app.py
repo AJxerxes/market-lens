@@ -1407,7 +1407,10 @@ with tab5:
             else:
                 st.caption(
                     "No Senate PTR filings ingested in the last 90 days. "
-                    "Run House + Senate ingestion above (Senate scraping requires Playwright)."
+                    "Run House + Senate ingestion above (Senate scraping requires Playwright). "
+                    "If it stays empty after running, check the server console for a "
+                    "'[Senate] Blocked...' or '[Senate] No consent...' line — senate.gov "
+                    "sometimes blocks the request outright rather than returning no results."
                 )
 
         with st.expander("Raw lobbying filings (last 60 days)"):

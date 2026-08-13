@@ -430,10 +430,22 @@ def ingest_senate_disclosures():
 
             # Step 1 — consent
             print("[Senate] Loading consent page...")
-            await page.goto(f"{base_url}/search/home/", timeout=30000)
+            resp = await page.goto(f"{base_url}/search/home/", timeout=30000)
             await page.wait_for_timeout(2000)
 
-            await page.evaluate("""
+            # The site (Akamai-fronted) can flat-out block the request before any
+            # HTML we care about loads — e.g. an IP/ASN-level block on a
+            # datacenter or cloud egress IP, which looks nothing like normal
+            # anti-bot friction. Fail loudly here instead of silently limping
+            # through the rest of the flow and reporting a vague "no data" at
+            # the end, which is indistinguishable from "genuinely no filings".
+            if resp is not None and resp.status >= 400:
+                body_snippet = (await page.content())[:300]
+                print(f"[Senate] Blocked loading consent page: HTTP {resp.status}. Body: {body_snippet}")
+                await browser.close()
+                return
+
+            checkbox_found = await page.evaluate("""
                 () => {
                     const cb = document.querySelector('input[type="checkbox"]');
                     if (cb) {
@@ -443,9 +455,16 @@ def ingest_senate_disclosures():
                         setter.call(cb, true);
                         cb.dispatchEvent(new Event('change', {bubbles: true}));
                         cb.dispatchEvent(new Event('click', {bubbles: true}));
+                        return true;
                     }
+                    return false;
                 }
             """)
+            if not checkbox_found:
+                title = await page.title()
+                print(f"[Senate] No consent checkbox found on page (title: {title!r}) — site structure may have changed, or the page didn't render.")
+                await browser.close()
+                return
             await page.wait_for_timeout(1000)
 
             await page.evaluate("""
@@ -462,6 +481,18 @@ def ingest_senate_disclosures():
             await page.wait_for_load_state("networkidle", timeout=15000)
             await page.wait_for_timeout(2000)
             print(f"[Senate] After consent: {page.url}")
+
+            # Consent should land on the actual search form; if the PTR
+            # filter checkboxes aren't there, everything downstream will
+            # silently no-op the same way the missing-checkbox case above did.
+            has_search_form = await page.evaluate(
+                "() => document.querySelectorAll('input[name=\\'report_type\\']').length > 0"
+            )
+            if not has_search_form:
+                title = await page.title()
+                print(f"[Senate] Consent did not reach the search form (title: {title!r}, url: {page.url}) — report_type filter not found.")
+                await browser.close()
+                return
 
             # Step 2 — set PTR filter and date range
             end_date = datetime.utcnow()

@@ -52,7 +52,14 @@ def _cik_10(cik: Any) -> str:
 def refresh_ticker_cik_map(session_orm) -> None:
     """Download company_tickers.json and upsert ticker_cik_map."""
     s = _session()
-    r = s.get(COMPANY_TICKERS_URL)
+    try:
+        r = s.get(COMPANY_TICKERS_URL, timeout=30)
+    except requests.exceptions.Timeout:
+        print(f"[TIMEOUT] {COMPANY_TICKERS_URL} timed out after 30 seconds — skipping CIK map refresh")
+        return
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] {COMPANY_TICKERS_URL} request failed: {e}")
+        return
     _rate_limit()
     r.raise_for_status()
     data = r.json()
