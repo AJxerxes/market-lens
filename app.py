@@ -1046,13 +1046,13 @@ with tab6:
 
     # Research Radar - external research mentions not yet on the watchlist
     st.markdown("---")
-    st.subheader("Research Radar (last 30 days)")
-    st.caption("Tickers mentioned by tracked Substack authors. Only shows tickers in your watchlist.")
+    st.subheader("Research Radar (last 60 days)")
+    st.caption("Tickers mentioned by tracked Substack authors that aren't on your watchlist yet — a discovery feed, not a watchlist filter.")
     from datetime import date as _date
 
     session = _session()
     try:
-        radar_cutoff = _date.today() - timedelta(days=30)
+        radar_cutoff = _date.today() - timedelta(days=60)
         radar_rows = (
             session.query(ResearchRadar)
             .filter(ResearchRadar.mention_date >= radar_cutoff)
@@ -1104,7 +1104,13 @@ with tab6:
                         except Exception as e:
                             st.error(f"Add to watchlist failed: {e}")
         else:
-            st.info("No Substack research radar entries in the last 30 days.")
+            if session.query(SubstackFeed).count() == 0:
+                st.info(
+                    "No Substack authors are being tracked yet — add one in the "
+                    "System tab to start populating this feed."
+                )
+            else:
+                st.info("No non-watchlist ticker mentions from tracked authors in the last 60 days.")
     finally:
         session.close()
 
