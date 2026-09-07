@@ -61,6 +61,7 @@ from market_lens.alerts.notifier import send_telegram, send_email, format_telegr
 from market_lens.ingestion.congress_tracker import (
     ingest_house_disclosures,
     ingest_senate_disclosures,
+    ingest_house_ptr_search,
     compute_recent_trading_activity,
     get_congress_hearing_timeline,
     compute_convergence_signals,
@@ -253,7 +254,12 @@ if st.sidebar.button("Force Refresh All Data", type="primary"):
             import threading
             from market_lens.ingestion.prices import run_prices_for_all
             from market_lens.ingestion.edgar import run_edgar_for_all
-            from market_lens.ingestion.congress_tracker import ingest_house_disclosures, ingest_senate_disclosures
+            from market_lens.ingestion.congress_tracker import (
+                ingest_house_disclosures,
+                ingest_senate_disclosures,
+                ingest_house_ptr_search,
+            )
+            from market_lens.ingestion.oge import ingest_oge_executive_filings
             from market_lens.ingestion.tracked_funds import run_tracked_funds_ingestion
             from market_lens.ingestion.short_interest import ingest_short_interest
             from market_lens.ingestion.substack_reader import run_substack_ingestion
@@ -273,6 +279,10 @@ if st.sidebar.button("Force Refresh All Data", type="primary"):
             congress_thread = threading.Thread(target=_run_congress_thread, daemon=True)
             congress_thread.start()
             congress_thread.join(timeout=120)
+
+            # Plain HTTP, no Playwright — don't need the Senate thread's timeout guard
+            ingest_house_ptr_search()
+            ingest_oge_executive_filings()
 
             ingest_earnings_calendar()
             run_tracked_funds_ingestion()
@@ -334,6 +344,7 @@ def run_all_ingestion():
             ingest_house_disclosures,
             ingest_senate_disclosures,
         )
+        from market_lens.ingestion.oge import ingest_oge_executive_filings
         from market_lens.ingestion.tracked_funds import run_tracked_funds_ingestion
         from market_lens.ingestion.substack_reader import run_substack_ingestion
         from market_lens.ingestion.short_interest import ingest_short_interest
@@ -343,6 +354,7 @@ def run_all_ingestion():
         ingest_earnings_calendar()
         ingest_house_disclosures()
         ingest_senate_disclosures()
+        ingest_oge_executive_filings()
         run_tracked_funds_ingestion()
         ingest_short_interest()
         run_substack_ingestion()
@@ -354,6 +366,7 @@ if "scheduler_started" not in st.session_state:
     st.session_state.scheduler_started = True
     scheduler = BackgroundScheduler(timezone="America/New_York")
     scheduler.add_job(run_all_ingestion, "interval", hours=2, id="auto_refresh")
+    scheduler.add_job(ingest_house_ptr_search, "interval", minutes=30, id="house_ptr_search")
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown(wait=False))
 
@@ -1234,14 +1247,33 @@ with tab5:
     # Optional on-demand ingestion trigger
     session = _session()
     try:
-        if st.button("Run House + Senate ingestion now"):
-            with st.spinner("Running congressional disclosures ingestion..."):
-                try:
-                    ingest_house_disclosures()
-                    ingest_senate_disclosures()
-                    st.success("Congress ingestion complete. Reload this tab to see any new trades.")
-                except Exception as e:
-                    st.error(f"Congress ingestion failed: {e}")
+        col_full, col_ptr, col_oge = st.columns(3)
+        with col_full:
+            if st.button("Run House + Senate ingestion now"):
+                with st.spinner("Running congressional disclosures ingestion..."):
+                    try:
+                        ingest_house_disclosures()
+                        ingest_senate_disclosures()
+                        st.success("Congress ingestion complete. Reload this tab to see any new trades.")
+                    except Exception as e:
+                        st.error(f"Congress ingestion failed: {e}")
+        with col_ptr:
+            if st.button("Run House PTR search now", help="Near-real-time House PTR filings; also runs automatically every 30 minutes."):
+                with st.spinner("Querying House Financial Disclosure search..."):
+                    try:
+                        ingest_house_ptr_search()
+                        st.success("House PTR search complete. Reload this tab to see any new filings.")
+                    except Exception as e:
+                        st.error(f"House PTR search failed: {e}")
+        with col_oge:
+            if st.button("Run OGE executive filings now", help="Trump, cabinet, and agency head PTRs via Open Cabinet's structured OGE data."):
+                with st.spinner("Downloading Open Cabinet OGE transaction data..."):
+                    try:
+                        from market_lens.ingestion.oge import ingest_oge_executive_filings
+                        ingest_oge_executive_filings()
+                        st.success("OGE executive filings ingestion complete. Reload this tab to see any new trades.")
+                    except Exception as e:
+                        st.error(f"OGE ingestion failed: {e}")
     finally:
         session.close()
 

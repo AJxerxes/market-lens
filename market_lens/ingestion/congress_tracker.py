@@ -356,6 +356,171 @@ def ingest_house_disclosures(limit: int = 500) -> None:
     print(f"[House] Complete — Inserted: {inserted} | Skipped: {skipped}")
 
 
+def _normalize_house_search_name(raw_name: str) -> str:
+    """
+    The search results table renders names as "Last, Hon.. First Middle."
+    while the zip XML gives separate First/Last fields (no title). Normalize
+    to "First Middle Last" so both ingestion paths land on the same
+    CongressMember row instead of creating look-alike duplicates.
+    """
+    name = raw_name.replace("Hon..", "").strip()
+    if "," in name:
+        last, first = name.split(",", 1)
+        name = f"{first.strip()} {last.strip()}"
+    return re.sub(r"\s+", " ", name).strip().rstrip(".")
+
+
+def ingest_house_ptr_search() -> None:
+    """
+    Near-real-time House PTR filings via the Financial Disclosure Search tool,
+    as an improvement over waiting for the annual zip (ingest_house_disclosures)
+    to be regenerated. Meant to run every 30 minutes from the scheduler.
+
+    The search form's LastName field is marked required client-side, but the
+    server doesn't enforce it — an empty LastName + a FilingYear returns every
+    filing for that year in one request, no per-member enumeration needed.
+    Confirmed live: an empty search returned all ~389 filings for the current
+    year in a single POST.
+
+    ponytail: the results table has no filing-date column (only Name, Office,
+    Filing Year, Filing type), so newly-discovered rows here are stamped with
+    today's date as an approximation rather than the real filing date. Uses
+    the same trade_id scheme as ingest_house_disclosures(), so once the
+    annual zip catches up it will see the row already exists and skip it —
+    the approximate date is never corrected. Upgrade path: open the PTR PDF
+    (like Form 4 does for EDGAR) to read the real filing date, if the
+    approximate date ever proves too imprecise for signal timing.
+    """
+    base_url = "https://disclosures-clerk.house.gov"
+    headers = {"User-Agent": USER_AGENT}
+    today = _utc_today()
+    inserted = 0
+    skipped = 0
+
+    session_http = requests.Session()
+    session_http.headers.update(headers)
+
+    for year in (today.year, today.year - 1):
+        try:
+            r = session_http.get(f"{base_url}/FinancialDisclosure/ViewSearch", timeout=30)
+            if r.status_code != 200:
+                print(f"[House PTR search] {year}: ViewSearch page returned {r.status_code} — skipping")
+                continue
+            token_el = BeautifulSoup(r.text, "html.parser").find(
+                "input", {"name": "__RequestVerificationToken"}
+            )
+            if not token_el or not token_el.get("value"):
+                print(f"[House PTR search] {year}: no CSRF token found — site structure may have changed")
+                continue
+            token = token_el["value"]
+
+            resp = session_http.post(
+                f"{base_url}/FinancialDisclosure/ViewMemberSearchResult",
+                data={
+                    "LastName": "",
+                    "FilingYear": str(year),
+                    "State": "",
+                    "District": "",
+                    "__RequestVerificationToken": token,
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                print(f"[House PTR search] {year}: search POST returned {resp.status_code} — skipping")
+                continue
+
+            rows = BeautifulSoup(resp.text, "html.parser").select("tbody tr")
+            if not rows:
+                print(f"[House PTR search] {year}: 0 rows returned")
+                continue
+
+            session_orm = _get_session()
+            try:
+                for row in rows:
+                    try:
+                        cells = row.find_all("td")
+                        if len(cells) < 4:
+                            skipped += 1
+                            continue
+                        filing_type = cells[3].get_text(strip=True)
+                        if "PTR" not in filing_type:
+                            skipped += 1
+                            continue
+
+                        name_link = cells[0].find("a")
+                        if not name_link or not name_link.get("href"):
+                            skipped += 1
+                            continue
+                        member_name = _normalize_house_search_name(name_link.get_text())
+                        pdf_href = name_link["href"]
+                        doc_id_match = re.search(r"/(\d+)\.pdf", pdf_href)
+                        if not member_name or not doc_id_match:
+                            skipped += 1
+                            continue
+                        doc_id = doc_id_match.group(1)
+
+                        trade_id = f"house_ptr_{year}_{doc_id}"
+                        existing = (
+                            session_orm.query(CongressTrade).filter_by(trade_id=trade_id).first()
+                        )
+                        if existing:
+                            skipped += 1
+                            continue
+
+                        pdf_url = f"{base_url}/public_disc/ptr-pdfs/{year}/{doc_id}.pdf"
+
+                        member_row = (
+                            session_orm.query(CongressMember)
+                            .filter_by(name=member_name, chamber="house")
+                            .first()
+                        )
+                        if not member_row:
+                            member_row = CongressMember(
+                                member_id=f"house_name::{member_name}",
+                                name=member_name,
+                                chamber="house",
+                            )
+                            session_orm.add(member_row)
+                            session_orm.flush()
+
+                        session_orm.add(
+                            CongressTrade(
+                                trade_id=trade_id,
+                                member_id=member_row.member_id,
+                                ticker="PTR_PENDING",
+                                company_name=f"House PTR — {pdf_url}",
+                                transaction_type="disclosure",
+                                trade_date=today,
+                                disclosure_date=today,
+                                days_to_disclose=0,
+                                committee_correlated=False,
+                                cluster_flag=False,
+                                source="house_ptr_search",
+                            )
+                        )
+                        inserted += 1
+                    except Exception as e:
+                        print(f"[House PTR search] Row error: {e}")
+                        skipped += 1
+                        continue
+
+                session_orm.commit()
+            finally:
+                session_orm.close()
+
+            _rate_limit_house_search()
+        except Exception as e:
+            print(f"[House PTR search] {year} failed: {type(e).__name__}: {e}")
+            continue
+
+    print(f"[House PTR search] Complete — Inserted: {inserted} | Skipped: {skipped}")
+
+
+def _rate_limit_house_search():
+    import time
+    time.sleep(0.5)
+
+
 def _ingest_house_from_zip(year: int) -> None:
     """
     Diagnostic helper: download House annual PTR ZIP(s) and print basic info.
