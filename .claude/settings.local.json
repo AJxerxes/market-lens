@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv_mac/bin/python -m market_lens.database.seed)",
+      "Bash(venv_mac/bin/streamlit run *)",
+      "Bash(disown)",
+      "Bash(echo \"launched, pid: $!\")",
+      "Read(//private/tmp/**)",
+      "Bash(npx --version)",
+      "Bash(open http://localhost:8501)"
+    ]
+  }
+}
